@@ -3,34 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DistAlgo Live</title>
+<title>DistAlgo Replay</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header class="bar">
-  <div class="brand">DistAlgo <span>Live</span></div>
-  <label class="ctl">
-    <span>Example</span>
-    <select id="example"><option value="">Load an example…</option></select>
-  </label>
-  <label class="ctl">
-    <span>Arguments</span>
-    <input id="argv" type="text" spellcheck="false" placeholder="e.g. 3 1" size="10">
-  </label>
-  <label class="ctl" title="How long every message takes to arrive (virtual time)">
-    <span>Delay</span>
-    <input id="delay" type="number" min="0" step="1" value="20" style="width:62px"> <span>ms</span>
-  </label>
-  <label class="ctl" title="Extra random delay per message, 0 to this many ms (seeded, so runs repeat)">
-    <span>±</span>
-    <input id="jitter" type="number" min="0" step="1" value="0" style="width:54px"> <span>ms</span>
-  </label>
-  <button id="run" class="primary" title="Compile the program and run main() (Ctrl+Enter)">Run</button>
-  <label class="check" title="When you re-run edited code, replay the same steps to get back to where you were">
-    <input id="keep" type="checkbox" checked> Keep my step on re-run
-  </label>
+  <div class="brand">DistAlgo <span>Replay</span></div>
+  <div class="trace-info" id="trace-info" title="The recorded run being replayed"></div>
   <div class="spacer"></div>
   <nav class="transport" aria-label="Time controls">
     <button id="reset" title="Back to the start (step 0)" aria-label="Reset">
@@ -39,13 +20,13 @@
       <svg viewBox="0 0 16 16"><path d="M10 2v12L2 8zM14 2v12h-2V2z"/></svg></button>
     <button id="step" title="Step forward (→)" aria-label="Step forward">
       <svg viewBox="0 0 16 16"><path d="M6 2v12l8-6zM2 2h2v12H2z"/></svg></button>
-    <button id="auto" title="Play steps one after another; pauses at breakpoints (space)" aria-label="Play">
+    <button id="auto" title="Play the recorded steps one after another; pauses at breakpoints (space)" aria-label="Play">
       <svg class="i-play" viewBox="0 0 16 16"><path d="M4 2v12l10-6z"/></svg>
       <svg class="i-pause" viewBox="0 0 16 16"><path d="M3 2h4v12H3zM9 2h4v12H9z"/></svg></button>
-    <select id="speed" title="How Play moves: one step at a time, or real time (the clock runs and pauses with Play)" aria-label="Play speed">
-      <option value="steps">Play: step by step</option>
+    <select id="speed" title="How Play moves: one step at a time, or at the speed the run was recorded" aria-label="Play speed">
+      <option value="steps" selected>Play: step by step</option>
       <option value="0.1">Play: 0.1× real time</option>
-      <option value="0.25" selected>Play: 0.25× real time</option>
+      <option value="0.25">Play: 0.25× real time</option>
       <option value="0.5">Play: 0.5× real time</option>
       <option value="1">Play: 1× real time</option>
       <option value="2">Play: 2× real time</option>
@@ -65,15 +46,14 @@
   <section class="left">
     <div class="tabs" id="tabs" role="tablist"></div>
     <div class="editor" id="editor">
-      <div class="gutter" id="gutter" title="Click a line number to set a breakpoint"></div>
+      <div class="gutter" id="gutter" title="Click a line number to set a breakpoint: Run to breakpoint stops at the next step that reaches it (a send, output, await, new/setup/start or receive handler on that line)"></div>
       <div class="code">
         <pre class="backdrop" id="backdrop" aria-hidden="true"></pre>
-        <textarea id="code" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off"></textarea>
+        <textarea id="code" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off" readonly aria-label="Program source (read-only)"></textarea>
       </div>
     </div>
     <div class="empty" id="empty">
-      <p>Add a process, write its DistAlgo code, then write <code>main()</code> to create and start processes.</p>
-      <p><button id="add-first">Add a process</button> <button id="load-pingpong">Load Ping-Pong</button></p>
+      <p>Loading the recorded run…</p>
     </div>
     <section class="conds">
       <div class="panel-head">
@@ -101,7 +81,7 @@
         <div class="cards" id="cards"></div>
       </div>
       <div class="timeline" id="timeline" hidden><svg id="tlsvg"></svg></div>
-      <div class="stage-empty" id="stage-empty"><p>Press <b>Run</b> to start the program. Its processes appear here.</p></div>
+      <div class="stage-empty" id="stage-empty"><p>Loading the recorded run…</p></div>
     </div>
   </section>
 

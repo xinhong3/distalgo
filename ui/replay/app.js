@@ -1,6 +1,8 @@
 'use strict';
-/* DistAlgo Live: front end.  Talks to server.py; all DistAlgo execution
-   happens there.  Drawing uses d3 (copied from DistAlgo's viz branch). */
+/* DistAlgo Replay: front end.  Adapted from DistAlgo Live's page; talks to
+   da/replay.py, which replays a recorded run (the steps, messages, state
+   and explanations all come from the run's event logs).  Drawing uses d3
+   (from DistAlgo's viz branch). */
 
 const $ = (id) => document.getElementById(id);
 const CLASS_COLORS = ['#1b8a7e', '#6a4bb3', '#b7770a', '#c0416b', '#3f6ea8',
@@ -17,7 +19,7 @@ const S = {
   bps: {},             // block name -> Set(line)
   conds: [],           // {expr, enabled}
   snap: null,
-  ranKey: null,        // code at the last run, to notice edits
+  info: null,          // the recorded run: logdir, program, steps, blocks
   sel: null,           // {type: 'proc', id} | {type: 'msg', key} | {type: 'change', i}
   view: 'network',
   auto: false,
@@ -41,7 +43,7 @@ let chain = Promise.resolve();
 function call(path, body) {
   const p = chain.then(() => {
     body = Object.assign({}, body || {});
-    if (S.snap && path !== '/api/run') {
+    if (S.snap && path !== '/api/load') {
       // ask only for history we do not have yet
       body.since = { gen: S.snap.gen };
       HISTORY.forEach((k) => { body.since[k] = S.snap[k].length; });
@@ -58,7 +60,12 @@ function call(path, body) {
 function mergeSnap(res) {
   if (res && res.running && res.delta) {
     if (S.snap && S.snap.gen === res.gen) {
-      HISTORY.forEach((k) => { res[k] = S.snap[k].concat(res[k]); });
+      // new items are appended; after a step back the server says how many
+      // of ours to keep
+      HISTORY.forEach((k) => {
+        const keep = res.trim && res.trim[k] != null ? S.snap[k].slice(0, res.trim[k]) : S.snap[k];
+        res[k] = keep.concat(res[k]);
+      });
     }
     res.delta = false;
   }
@@ -102,58 +109,9 @@ function visibleProcs() {
 }
 
 // ---------------------------------------------------------------- blocks
-const MAIN_TEMPLATE =
-`def main():
-    # Create processes with new(), pass arguments with setup(), then start() them.
-    pass
-`;
-function processTemplate(name) {
-  return `class ${name}(process):
-    def setup():
-        pass
-
-    def run():
-        pass
-
-    def receive(msg=('hello',), from_=p):
-        output('got hello from', p)
-`;
-}
-function kindOf(name, code) {
-  if (name === 'main') return 'main';
-  return /^\s*class\s+\w+\s*\([^)]*process[^)]*\)/m.test(code) ? 'process' : 'code';
-}
-function ensureMain() {
-  if (!S.blocks.some((b) => b.kind === 'main')) {
-    S.blocks.push({ name: 'main', code: MAIN_TEMPLATE, kind: 'main' });
-  }
-}
-function addProcess(name) {
-  name = name.trim();
-  if (!/^[A-Za-z_]\w*$/.test(name)) { setStatus('A process name must be a Python identifier, like Pong.', 'error'); return; }
-  if (S.blocks.some((b) => b.name === name)) { setStatus(`There is already a block named ${name}.`, 'error'); return; }
-  syncCode();
-  ensureMain();
-  const mainAt = S.blocks.findIndex((b) => b.kind === 'main');
-  S.blocks.splice(mainAt, 0, { name, code: processTemplate(name), kind: 'process' });
-  S.active = mainAt;
-  renderAll();
-  $('code').focus();
-}
-function removeBlock(i) {
-  syncCode();
-  const b = S.blocks[i];
-  S.blocks.splice(i, 1);
-  delete S.bps[b.name];
-  S.active = Math.max(0, Math.min(S.active, S.blocks.length - 1));
-  renderAll();
-  setStatus(`Removed ${b.name}.`, '', { undo: () => { S.blocks.splice(i, 0, b); S.active = i; renderAll(); } });
-}
-function codeKey() {
-  return JSON.stringify(S.blocks.map((b) => [b.name, b.code])) + '|' + $('argv').value +
-    '|' + $('delay').value + '|' + $('jitter').value;
-}
-function isStale() { return S.snap && S.ranKey !== codeKey(); }
+// The program is read-only: its blocks (one per process class, plus main)
+// come from the recorded source files.
+function isStale() { return false; }
 
 // ---------------------------------------------------------------- status
 function setStatus(text, kind, opts) {
@@ -190,41 +148,12 @@ function renderTabs() {
     const label = document.createElement('span');
     label.textContent = b.name;
     t.appendChild(label);
-    if (b.kind !== 'main') {
-      const x = document.createElement('button');
-      x.className = 'x';
-      x.title = `Remove ${b.name}`;
-      x.setAttribute('aria-label', `Remove ${b.name}`);
-      x.textContent = '×';
-      x.onclick = (e) => { e.stopPropagation(); removeBlock(i); };
-      t.appendChild(x);
-    }
     t.onclick = () => setActive(i);
     t.onkeydown = (e) => { if (e.key === 'Enter') setActive(i); };
     tabs.appendChild(t);
   });
-  const add = document.createElement('button');
-  add.className = 'tab add';
-  add.textContent = '+ Process';
-  add.title = 'Add a process (a server) and write its code';
-  add.onclick = () => showNewTab(add);
-  tabs.appendChild(add);
 }
-function showNewTab(btn) {
-  const box = document.createElement('div');
-  box.className = 'tab-new';
-  box.innerHTML = '<input placeholder="Process name" aria-label="Process name"><button class="small">Add</button>';
-  btn.replaceWith(box);
-  const inp = box.querySelector('input');
-  inp.focus();
-  const done = () => { if (inp.value.trim()) addProcess(inp.value); else renderTabs(); };
-  box.querySelector('button').onclick = done;
-  inp.onkeydown = (e) => { if (e.key === 'Enter') done(); if (e.key === 'Escape') renderTabs(); };
-}
-function syncCode() {
-  const b = S.blocks[S.active];
-  if (b) b.code = $('code').value;
-}
+function syncCode() {}
 function setActive(i, scrollLine) {
   syncCode();
   S.active = i;
@@ -400,50 +329,40 @@ function paintCondValue(row, v) {
   else badge.textContent = '–';
 }
 
-// ---------------------------------------------------------------- running
-async function run() {
+// ---------------------------------------------------------------- loading
+async function load() {
   stopAuto();
-  syncCode();
-  if (!S.blocks.length) { setStatus('Add a process or load an example first.', 'error'); return; }
-  ensureMain();
-  const stale = isStale();
-  const body = {
-    blocks: S.blocks.map((b) => ({ name: b.name, code: b.code })),
-    argv: $('argv').value,
-    delayMs: Math.max(0, +$('delay').value || 0),
-    jitterMs: Math.max(0, +$('jitter').value || 0),
-    keepPosition: stale && $('keep').checked,
-    breakpoints: bpPayload(),
-    conditions: S.conds,
-  };
-  const res = await call('/api/run', body);
-  if (res.error) {
-    S.error = res.where;
-    setStatus(res.error, 'error');
-    renderAll();
-    if (res.where) showBlock(res.where.block, res.where.line);
-    return;
+  const res = await call('/api/load', { breakpoints: bpPayload(), conditions: S.conds });
+  if (!res || res.error) { setStatus(res ? res.error : 'No answer from the server.', 'error'); return; }
+  S.info = res.info;
+  S.blocks = res.info.blocks.map((b) => ({ name: b.name, code: b.code, kind: b.kind }));
+  if (S.active >= S.blocks.length || !S.snap) {
+    S.active = Math.max(0, S.blocks.findIndex((b) => b.kind === 'process'));
   }
-  S.error = null;
-  S.ranKey = codeKey();
+  $('code').value = S.blocks.length ? S.blocks[S.active].code : '';
+  const prog = res.info.program ? res.info.program.split(/[\\/]/).pop() : '(program)';
+  $('trace-info').innerHTML = `<b>${esc(prog)}</b> · ${res.info.steps} steps · ${res.info.processes} processes · ${res.info.messages} messages · <span title="${esc(res.info.logdir)}">${esc(res.info.logdir.split(/[\\/]/).pop())}</span>`;
+  $('empty').style.display = 'none';
   S.sel = null;
   S.msgColors = {};
   S.lastLogCount = 0;
   S.centerNet = true;
-  const [rep, tot] = res.replayed || [0, 0];
-  let msg = 'main() has run. Step forward to deliver messages, or set a breakpoint and run to it.';
-  if (tot) {
-    msg = `Re-ran your edited code and replayed ${rep} of ${tot} steps.` +
-      (rep < tot ? ' The remaining steps no longer happen with the new code.' : '');
-  }
-  setSnap(res, { status: msg });
+  setSnap(res, { status: `Replaying ${prog}: ${res.info.steps} recorded steps. Step forward, play, or set a breakpoint or condition and run to it.` });
+}
+function gotoDelivery(key) {
+  const m = findMsg(key);
+  const fly = S.snap && S.snap.network.find((x) => x.key === key);
+  const at = m && m.recvStep != null ? m.recvStep : (fly ? fly.recvStep : null);
+  if (at == null) { setStatus('This message was never received in the recorded run.'); return; }
+  goto(at);
 }
 
-async function step(action) {
-  if (!S.snap) return run();
+async function step() {
+  if (!S.snap) return null;
   await flushBreakpoints();
-  const res = await call('/api/step', action ? { action } : {});
-  setSnap(res, { animate: true });
+  const res = await call('/api/step', {});
+  setSnap(res, { animate: true, status: res && res.lastStop && res.lastStop.reason === 'line' ? stopText(res) : undefined,
+                 kind: res && res.lastStop && res.lastStop.reason === 'line' ? 'stop' : '' });
   return res;
 }
 async function back() {
@@ -454,7 +373,7 @@ async function back() {
 async function reset() {
   if (!S.snap) return;
   stopAuto();
-  setSnap(await call('/api/goto', { step: 0 }), { status: 'Back at step 0, right after main() ran.' });
+  setSnap(await call('/api/goto', { step: 0 }), { status: 'Back at step 0.' });
 }
 async function goto(n) {
   if (!S.snap) return;
@@ -462,7 +381,6 @@ async function goto(n) {
   setSnap(await call('/api/goto', { step: n }), {});
 }
 async function runUntil() {
-  if (!S.snap) await run();
   if (!S.snap) return;
   stopAuto();
   await flushBreakpoints();
@@ -473,20 +391,19 @@ function stopText(snap) {
   const st = snap.lastStop;
   if (!st) return '';
   if (st.reason === 'line') {
-    const p = snap.processes.find((x) => x.id === snap.paused);
-    const at = p && p.pausedAt ? locStr(p.pausedAt.line) : '';
-    return `Paused at a breakpoint after ${st.steps} step${st.steps === 1 ? '' : 's'}: ${snap.paused} is at ${at}. Step forward to continue.`;
+    const after = st.steps ? ` after ${st.steps} step${st.steps === 1 ? '' : 's'}` : '';
+    return `Stopped at a breakpoint${after}: at step ${snap.step}, ${st.pid} reached ${locStr(st.at)}: ${st.at.text}`;
   }
   if (st.reason === 'condition') {
     const exprs = st.ids.map((i) => snap.conditions[i] && snap.conditions[i].expr).filter(Boolean);
     return `Paused after ${st.steps} step${st.steps === 1 ? '' : 's'}: ${exprs.join(' and ')} became true.`;
   }
-  if (st.reason === 'quiet') return `Ran ${st.steps} steps. Nothing else can happen: every process is waiting or finished.`;
+  if (st.reason === 'quiet') return `Ran ${st.steps} steps to the end of the recorded run.`;
   return `Ran ${st.steps} steps without reaching a breakpoint. Run again to keep going.`;
 }
 function toggleAuto() {
   if (S.auto) { stopAuto(); return; }
-  if (!S.snap) { run().then(() => { if (S.snap) startAuto(); }); return; }
+  if (!S.snap) return;
   startAuto();
 }
 async function startAuto() {
@@ -496,10 +413,10 @@ async function startAuto() {
   if (speed !== 'steps') { await realTimeLoop(+speed); stopAuto(); return; }
   while (S.auto) {
     const before = S.snap;
-    if (!before.next) { setStatus('Nothing else can happen: every process is waiting or finished.'); break; }
+    if (!before.next) { setStatus('End of the recorded run.'); break; }
     const res = await step();
     if (!S.auto) break;
-    if (res.paused) { setStatus(stopText(Object.assign({}, res, { lastStop: { reason: 'line', steps: 1 } })), 'stop'); break; }
+    if (res.lastStop && res.lastStop.reason === 'line') { setStatus(stopText(res), 'stop'); break; }
     const hit = (res.conditions || []).filter((c, i) =>
       c.enabled && c.value === true && !(before.conditions[i] && before.conditions[i].value === true));
     if (hit.length) { setStatus(`Paused: ${hit.map((c) => c.expr).join(' and ')} became true.`, 'stop'); break; }
@@ -532,7 +449,7 @@ async function realTimeLoop(speed) {
       break;
     }
     if (st && st.reason === 'quiet') {
-      setSnap(res, { status: 'Nothing else can happen: every process is waiting or finished, and no timer is pending.' });
+      setSnap(res, { status: 'End of the recorded run.' });
       break;
     }
     if (res.step === prevStep) quickRender(res);       // only the clock moved
@@ -563,6 +480,13 @@ function setSnap(snap, opts) {
       if (i >= 0 && i !== S.active) { syncCode(); S.active = i; $('code').value = S.blocks[i].code; }
       setTimeout(() => scrollToLine(l.line), 0);
     }
+  }
+  const ls = snap.lastStop;
+  if (ls && ls.reason === 'line' && ls.at) {
+    S.sel = { type: 'proc', id: ls.pid };
+    const i = S.blocks.findIndex((b) => b.name === ls.at.block);
+    if (i >= 0 && i !== S.active) { S.active = i; $('code').value = S.blocks[i].code; }
+    setTimeout(() => scrollToLine(ls.at.line), 0);
   }
   if (opts.status !== undefined) setStatus(opts.status, opts.kind || '');
   else setStatus(describeStep(snap), snap.paused ? 'stop' : '');
@@ -602,8 +526,8 @@ function describeStep(snap) {
     const p = procById(snap.paused);
     return `${snap.paused} is paused at a breakpoint (${p && p.pausedAt ? locStr(p.pausedAt.line) : ''}). Step forward to let it continue.`;
   }
-  if (snap.cursor === 0) return 'Step 0: main() has run and created the processes.';
   const what = describeAction(snap.lastAction, snap);
+  if (snap.cursor === 0 && snap.lastAction && snap.lastAction.pid === 'main') return 'Step 0: main() ran and created the processes.';
   return `Step ${snap.step}: ${what}.`;
 }
 function findMsg(key, snap) {
@@ -615,8 +539,8 @@ function findMsg(key, snap) {
   const fly = snap.network.find((m) => m.key === key);
   return {
     key, src: send.src, dst: send.dst, payload: send.payload, why: send.why,
-    sentStep: send.step, recvStep: done ? done.step : null,
-    dropped: done && done.kind === 'drop', inFlight: !!fly, arrives: fly ? fly.arrives : null,
+    sentStep: send.step, recvStep: done ? done.step : (fly ? fly.recvStep : null),
+    received: !!done, dropped: done && done.kind === 'drop', inFlight: !!fly, arrives: fly ? fly.arrives : null,
   };
 }
 function selectedWhy() {
@@ -637,13 +561,11 @@ function renderAll(opts) {
   renderStage(opts);
   renderLog();
   renderWhy();
-  const r = $('run');
-  r.textContent = !S.snap ? 'Run' : isStale() ? 'Re-run' : 'Restart';
-  r.classList.toggle('stale', !!isStale());
-  ['reset', 'back', 'step', 'until'].forEach((id) => { $(id).disabled = !S.snap && id !== 'step' && id !== 'until'; });
+  ['reset', 'back', 'step', 'until', 'auto'].forEach((id) => { $(id).disabled = !S.snap; });
   if (S.snap) {
-    $('back').disabled = S.snap.cursor === 0 && !S.snap.paused;
+    $('back').disabled = S.snap.cursor === 0;
     $('step').disabled = !S.snap.next;
+    $('until').disabled = !S.snap.next;
   }
 }
 
@@ -655,7 +577,7 @@ function renderTime() {
   sc.max = S.snap.cursor + S.snap.redo;
   sc.value = S.snap.cursor;
   clk.innerHTML = `<span>Step <b>${S.snap.step}</b> of ${S.snap.cursor + S.snap.redo}</span>
-    &nbsp;&nbsp; <span title="Virtual time: runs only while playing in real time">Time <b>${fmtTime(S.snap.time)}</b></span>
+    &nbsp;&nbsp; <span title="Recorded time since the run started">Time <b>${fmtTime(S.snap.time)}</b></span>
     &nbsp;&nbsp; <span>Next: ${esc(describeNext(S.snap))}</span>`;
 }
 
@@ -783,7 +705,7 @@ function renderNet(opts) {
     const pathNode = g.append('path').attr('d', c.d).attr('fill', 'none').attr('stroke', 'none').node();
     const L = pathNode.getTotalLength();
     ms.forEach((m) => {
-      const span = (m.arrives - m.sentAt) || 1e-9;
+      const span = m.arrives == null ? 1e9 : ((m.arrives - m.sentAt) || 1e-9);
       const f = Math.max(0, Math.min(1, (snap.time - m.sentAt) / span));
       const pt = pathNode.getPointAtLength(f * L);
       g.append('circle').attr('class', 'inflight-dot').attr('r', 5).attr('fill', color)
@@ -791,12 +713,13 @@ function renderNet(opts) {
     });
     const target = ms.find((m) => m.key === selKey) || ms[0];
     g.on('click', () => {
-      if (d3.event.shiftKey) { hideTip(); step({ type: 'deliver', msg: target.key }); return; }
+      if (d3.event.shiftKey) { hideTip(); gotoDelivery(target.key); return; }
       selectMsg(target.key);
     });
     g.on('mousemove', () => showTip(d3.event,
-      ms.map((m) => `${m.payload}   sent at step ${m.sentStep}, arrives at ${fmtTime(m.arrives)}`).join('\n') +
-      '\n\nClick to see why it was sent. Shift-click to deliver it now.'));
+      ms.map((m) => `${m.payload}   sent at step ${m.sentStep}, ` +
+        (m.recvStep != null ? `received at step ${m.recvStep}` : 'never received')).join('\n') +
+      '\n\nClick to see why it was sent. Shift-click to go to the step that delivers it.'));
     g.on('mouseleave', hideTip);
   });
 
@@ -878,7 +801,8 @@ function renderCards(procs, pos, compact) {
     let at = '';
     if (p.pausedAt) at = `paused at ${locStr(p.pausedAt.line)}: ${p.pausedAt.line.text}`;
     else if (p.waitingAt) at = `waiting at ${locStr(p.waitingAt)}: ${p.waitingAt.text}`;
-    else if (p.status === 'ready') at = 'started; runs at the next step';
+    else if (p.status === 'ready') at = 'started; runs at a later step';
+    else if (p.status === 'crashed' && p.error) at = 'crashed: ' + p.error;
     else if (p.status === 'setup' || p.status === 'created') at = 'created, not started';
     const rows = Object.entries(p.state).map(([k, v]) =>
       `<tr class="field${changedNow.has(k) ? ' changed' : ''}" data-field="${esc(k)}" title="Why does ${esc(k)} have this value?"><td class="k">${esc(k)}</td><td class="v">${esc(v)}</td></tr>`).join('');
@@ -886,7 +810,7 @@ function renderCards(procs, pos, compact) {
     const locs = inner ? Object.entries(inner.locals) : [];
     const localRows = locs.map(([k, v]) => `<tr><td class="k">${esc(k)}</td><td class="v">${esc(v)}</td></tr>`).join('');
     card.innerHTML = `
-      <div class="head"><span class="name" style="color:${classColor(p.cls)}">${esc(p.id)}</span>
+      <div class="head"><span class="name" style="color:${classColor(p.cls)}" title="${esc(p.realId || p.id)}">${esc(p.id)}</span>
         <span class="badge ${p.status}">${p.status}</span><span class="clk" title="Lamport clock">clock ${p.clock == null ? '–' : p.clock}</span></div>
       ${at ? `<span class="at" title="${esc(at)}">${esc(at)}</span>` : ''}
       ${rows ? `<table>${rows}</table>` : '<div class="sub">no fields</div>'}
@@ -979,7 +903,7 @@ function renderTimeline() {
 // ---------------------------------------------------------------- log
 function renderLog() {
   const el = $('log');
-  if (!S.snap) { el.innerHTML = '<div class="row"><span></span><span></span><span class="t" style="color:var(--muted)">Logs from output(), print() and the runtime appear here.</span></div>'; return; }
+  if (!S.snap) { el.innerHTML = '<div class="row"><span></span><span></span><span class="t" style="color:var(--muted)">Output from output() and runtime events appear here.</span></div>'; return; }
   const showSys = $('show-sys').checked;
   const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
   const rows = S.snap.logs.filter((l) => showSys || l.kind !== 'system').map((l) => {
@@ -1065,7 +989,7 @@ function renderWhy() {
   const el = $('why');
   const snap = S.snap;
   if (!snap) {
-    el.innerHTML = '<p class="muted">After you run the program, select a message, a process or a field to see why it happened. The code that caused it is highlighted.</p>';
+    el.innerHTML = '<p class="muted">Select a message, a process or a field to see why it happened. The code that caused it is highlighted.</p>';
     return;
   }
   const sel = S.sel;
@@ -1081,8 +1005,10 @@ function renderWhy() {
       }
       h += causeHtml(m.why, m.src) + pathHtml(m.why);
       if (m.inFlight) {
-        h += `<p class="muted">Still in flight; it would arrive at ${(m.arrives * 1000).toFixed(1)} ms.
-          <button class="small" data-deliver="${esc(m.key)}">Deliver it now</button></p>`;
+        h += m.recvStep != null ?
+          `<p class="muted">Still in flight at this step; it is delivered at step ${m.recvStep}.
+          <button class="small" data-deliver="${esc(m.key)}">Go to step ${m.recvStep}</button></p>` :
+          '<p class="muted">Still in flight: the recorded run ended before it was received.</p>';
       } else {
         h += `<p class="muted">${m.dropped ? 'Dropped' : 'Delivered'} at step ${m.recvStep}.</p>`;
       }
@@ -1092,7 +1018,7 @@ function renderWhy() {
     if (c) {
       h += `<h3>Why did ${esc(c.pid)}.${esc(c.field)} change?</h3>`;
       h += `<p><code>${esc(c.old == null ? '(unset)' : c.old)}</code> became <code>${esc(c.new)}</code> at step ${c.step},
-        by <code>${esc(c.why ? c.why.line.text : '')}</code>.</p>`;
+        in <code>${esc(c.why ? c.why.line.text : '')}</code>.</p>`;
       h += causeHtml(c.why, c.pid) + pathHtml(c.why);
       const older = snap.changes.map((x, i) => [x, i]).filter(([x, i]) => x.pid === c.pid && x.field === c.field && i < sel.i);
       if (older.length) {
@@ -1110,8 +1036,10 @@ function renderWhy() {
           h += `<li data-block="${esc(f.block)}" data-line="${f.line}"><span class="loc">${esc(f.func)}()</span><code>${esc(f.text)}</code></li>`;
         });
         h += '</ul>';
-      } else if (p.status === 'done') {
-        h += '<p>Its <code>run()</code> has finished. Messages sent to it are dropped.</p>';
+      } else if (p.status === 'done' || p.status === 'exited') {
+        h += '<p>Its <code>run()</code> has finished.</p>';
+      } else if (p.status === 'crashed') {
+        h += `<p>It crashed: <code>${esc(p.error || '')}</code></p>`;
       } else {
         h += '<p>It has not started running yet.</p>';
       }
@@ -1125,7 +1053,7 @@ function renderWhy() {
   el.innerHTML = h;
   el.querySelectorAll('[data-msg]').forEach((a) => { a.onclick = () => selectMsg(a.dataset.msg); });
   el.querySelectorAll('[data-change]').forEach((a) => { a.onclick = () => selectChange(+a.dataset.change); });
-  el.querySelectorAll('[data-deliver]').forEach((b) => { b.onclick = () => step({ type: 'deliver', msg: b.dataset.deliver }); });
+  el.querySelectorAll('[data-deliver]').forEach((b) => { b.onclick = () => gotoDelivery(b.dataset.deliver); });
   el.querySelectorAll('li[data-block]').forEach((li) => { li.onclick = () => showBlock(li.dataset.block, +li.dataset.line); });
 }
 function stepItems(snap, pid) {
@@ -1154,87 +1082,15 @@ function showTip(ev, text) {
 }
 function hideTip() { $('tip').style.opacity = 0; }
 
-// ---------------------------------------------------------------- examples
-async function loadExamples() {
-  const res = await fetch('/api/examples').then((r) => r.json());
-  S.examples = res.examples || [];
-  const sel = $('example');
-  const demo = document.createElement('optgroup');
-  demo.label = 'Demo';
-  const da = document.createElement('optgroup');
-  da.label = 'DistAlgo examples';
-  S.examples.forEach((ex, i) => {
-    const o = document.createElement('option');
-    o.value = i;
-    o.textContent = ex.name;
-    (ex.source === 'demo' ? demo : da).appendChild(o);
-  });
-  if (demo.children.length) sel.appendChild(demo);
-  if (da.children.length) sel.appendChild(da);
-}
-function loadExample(ex) {
-  stopAuto();
-  S.snap = null;          // a new program: the next Run starts fresh
-  S.ranKey = null;
-  S.blocks = ex.blocks.map((b) => ({ name: b.name, code: b.code, kind: kindOf(b.name, b.code) }));
-  ensureMain();
-  S.active = Math.max(0, S.blocks.findIndex((b) => b.kind === 'process'));
-  S.bps = {};
-  S.sel = null;
-  S.error = null;
-  $('argv').value = ex.argv || '';
-  $('code').value = S.blocks[S.active].code;
-  renderAll();
-  setStatus(`Loaded ${ex.name}. Press Run to start it.`);
-}
-
 // ---------------------------------------------------------------- wiring
 function wire() {
   const ta = $('code');
-  ta.addEventListener('input', () => {
-    const b = S.blocks[S.active];
-    if (!b) return;
-    b.code = ta.value;
-    if (b.kind !== 'main') {
-      const m = /^\s*class\s+(\w+)/m.exec(b.code);
-      const nk = kindOf(b.name, b.code);
-      if (m && m[1] !== b.name && !S.blocks.some((x) => x !== b && x.name === m[1])) {
-        if (S.bps[b.name]) { S.bps[m[1]] = S.bps[b.name]; delete S.bps[b.name]; }
-        b.name = m[1];
-      }
-      b.kind = nk;
-    }
-    renderTabs();
-    renderEditor();
-    const r = $('run');
-    r.textContent = !S.snap ? 'Run' : isStale() ? 'Re-run' : 'Restart';
-    r.classList.toggle('stale', !!isStale());
-  });
   ta.addEventListener('scroll', syncScroll);
-  ta.addEventListener('keydown', (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); run(); return; }
-    if (e.key === 'Tab') {
-      e.preventDefault();
-      document.execCommand('insertText', false, '    ');
-    } else if (e.key === 'Enter') {
-      const v = ta.value, i = ta.selectionStart;
-      const lineStart = v.lastIndexOf('\n', i - 1) + 1;
-      const line = v.slice(lineStart, i);
-      let indent = /^\s*/.exec(line)[0];
-      if (/:\s*$/.test(line)) indent += '    ';
-      e.preventDefault();
-      document.execCommand('insertText', false, '\n' + indent);
-    }
-  });
   $('gutter').addEventListener('click', (e) => {
     const d = e.target.closest('div[data-line]');
     if (d) toggleBreakpoint(+d.dataset.line);
   });
-  $('argv').addEventListener('input', () => renderAll());
-  $('delay').addEventListener('input', () => renderAll());
-  $('jitter').addEventListener('input', () => renderAll());
   $('speed').addEventListener('change', () => { if (S.auto) stopAuto(); });
-  $('run').onclick = run;
   $('step').onclick = () => { stopAuto(); step(); };
   $('back').onclick = back;
   $('reset').onclick = reset;
@@ -1243,16 +1099,6 @@ function wire() {
   $('scrub').addEventListener('change', (e) => goto(+e.target.value));
   $('add-cond').onclick = () => { S.conds.push({ expr: '', enabled: true }); renderConds(); const ins = $('cond-list').querySelectorAll('input[type=text]'); ins[ins.length - 1].focus(); };
   $('show-sys').onchange = renderLog;
-  $('example').onchange = (e) => {
-    const ex = S.examples[+e.target.value];
-    if (ex) loadExample(ex);
-    e.target.value = '';
-  };
-  $('add-first').onclick = () => { ensureMain(); renderAll(); showNewTab($('tabs').querySelector('.tab.add')); };
-  $('load-pingpong').onclick = () => {
-    const ex = S.examples.find((x) => x.name === 'pingpong' && x.source === 'demo') || S.examples[0];
-    if (ex) loadExample(ex);
-  };
   document.querySelectorAll('.viewtabs button[data-view]').forEach((b) => {
     b.onclick = () => {
       S.view = b.dataset.view;
@@ -1279,4 +1125,4 @@ function wire() {
 
 wire();
 renderAll();
-loadExamples().catch(() => setStatus('Could not reach the server. Is server.py running?', 'error'));
+load().catch(() => setStatus('Could not reach the server. Is python -m da.replay running?', 'error'));
