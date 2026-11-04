@@ -319,16 +319,17 @@ class SourceMap:
             return {}
 
     def loc(self, fn, line):
+        """{'block', 'line' (in the block), 'text'} of a line of a file."""
         info = self.files.get(fn)
         if info is None or line is None:
-            return {'block': None, 'line': line, 'text': '', 'file': fn}
+            return {'block': None, 'line': line, 'text': ''}
         for name, first, last in info['blocks']:
             if first <= line <= last:
                 text = info['lines'][line - 1].strip() \
                     if 1 <= line <= len(info['lines']) else ''
                 return {'block': name, 'line': line - first + 1,
-                        'text': text, 'file': fn}
-        return {'block': None, 'line': line, 'text': '', 'file': fn}
+                        'text': text}
+        return {'block': None, 'line': line, 'text': ''}
 
     def entry_chain(self, fn, line):
         """Enclosing block entries of a line, innermost first; the loops the
@@ -875,6 +876,9 @@ class ReplaySession:
                 s['clock'] = e.get('clk', s['clock'])
                 if e.get('state') is not None:
                     s['state'] = e['state']
+                if e.get('frames'):
+                    # where it is (with locals at awaits)
+                    s['frames'] = e['frames']
                 if kind == 'new':
                     for c in e.get('children', []):
                         ensure(c)
@@ -979,7 +983,7 @@ class ReplaySession:
                 else None
             net.append({'key': m.key, 'src': T.key(m.src), 'dst': T.key(m.dst),
                         'payload': fmt(m.value), 'clk': m.sclk,
-                        'sentStep': m.send_step, 'why': m.why,
+                        'sentStep': m.send_step,
                         'sentAt': round(sent_at, 6),
                         'arrives': round(arrives, 6) if arrives is not None
                         else None,
@@ -1010,12 +1014,19 @@ class ReplaySession:
             for c, (_, v, err) in zip(self.conditions,
                                       self.eval_conditions(states))]
         snap['conditionNames'] = self.condition_names(states)
-        if since and since.get('gen') == self.gen and all(
-                0 <= int(since.get(k, 0)) <= len(snap[k])
-                for k in self.HISTORY):
+        if since and since.get('gen') == self.gen:
+            # The history lists only grow with the step, so the page needs
+            # only what it does not have yet; after a step back, only how
+            # many items to keep ('trim').
             snap['delta'] = True
+            snap['trim'] = {}
             for k in self.HISTORY:
-                snap[k] = snap[k][int(since.get(k, 0)):]
+                have = max(0, int(since.get(k, 0)))
+                if have <= len(snap[k]):
+                    snap[k] = snap[k][have:]
+                else:
+                    snap['trim'][k] = len(snap[k])
+                    snap[k] = []
         return snap
 
     def info(self):
@@ -1167,9 +1178,17 @@ class ReplaySession:
 
         scope = {}
         for s in states.values():
-            if s['main'] and s.get('main_locals'):
-                for k, v in s['main_locals'].items():
-                    scope[k] = viewify(decode_value(v, T.pids))
+            if not s['main']:
+                continue
+            # main()'s variables: as it returned, or at its latest await
+            local_vars = s.get('main_locals')
+            if not local_vars:
+                local_vars = next((fr.get('locals') for fr in
+                                   reversed(s['frames'])
+                                   if fr.get('locals') is not None and
+                                   fr['func'] == 'run'), None) or {}
+            for k, v in local_vars.items():
+                scope[k] = viewify(decode_value(v, T.pids))
         allv = list(views.values())
         scope.update({'procs': allv,
                       'network': [(views.get(T.pids.get(m.src), m.src),
@@ -1269,7 +1288,11 @@ def api(path, body):
         s.set_conditions(body.get('conditions', []))
     elif path == '/api/step':
         s.last_stop = None
-        s.forward()
+        if s.forward():
+            hit = s._hit_line(s.cursor)
+            if hit:
+                hit['steps'] = 1
+                s.last_stop = hit
     elif path == '/api/back':
         s.last_stop = None
         s.back()
