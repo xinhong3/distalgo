@@ -757,14 +757,111 @@ class WaitableQueue:
     def __len__(self):
         return self._q.__len__()
 
+def encode_value(value, depth=0, maxdepth=8, maxitems=500):
+    """Encodes `value` as JSON-compatible data, keeping the Python types that
+    DistAlgo programs use (tuples, sets, dicts with any keys, process ids), so
+    that a recorded value can be turned back into an equivalent Python value
+    later (see `da.replay.decode_value`).
+
+    Tagged forms: {"$pid": id, "cls": name, "short": "<Cls:xxxxx>"},
+    {"$tuple": [...]}, {"$set": [...]}, {"$dict": [[k, v], ...]},
+    {"$obj": type name, "fields": {...}}, {"$repr": "..."} for anything else,
+    and {"$more": n} for items left out of a very large container.
+
+    """
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if value == value and value not in (float('inf'),
+                                                         float('-inf')) \
+            else {"$repr": repr(value)}
+    if isinstance(value, ProcessId):
+        return {"$pid": value._filename_form_(), "cls": value.pcls.__name__,
+                "short": value._short_form_()}
+    if depth >= maxdepth:
+        return {"$repr": _short_repr(value)}
+
+    def items(seq):
+        out = []
+        for i, x in enumerate(seq):
+            if i >= maxitems:
+                out.append({"$more": len(seq) - maxitems})
+                break
+            out.append(encode_value(x, depth + 1, maxdepth, maxitems))
+        return out
+
+    if isinstance(value, tuple):
+        return {"$tuple": items(value)}
+    if isinstance(value, list):
+        return items(value)
+    if isinstance(value, (set, frozenset)):
+        try:
+            elems = sorted(value, key=repr)
+        except Exception:
+            elems = list(value)
+        return {"$set": items(elems)}
+    if isinstance(value, dict):
+        pairs = []
+        for i, (k, v) in enumerate(value.items()):
+            if i >= maxitems:
+                pairs.append({"$more": len(value) - maxitems})
+                break
+            pairs.append([encode_value(k, depth + 1, maxdepth, maxitems),
+                          encode_value(v, depth + 1, maxdepth, maxitems)])
+        return {"$dict": pairs}
+    if isinstance(value, bytes):
+        return {"$repr": _short_repr(value)}
+    if isinstance(value, type):
+        return {"$repr": value.__name__}
+    fields = getattr(value, '__dict__', None)
+    if isinstance(fields, dict) and type(value).__repr__ is object.__repr__:
+        return {"$obj": type(value).__name__,
+                "fields": {k: encode_value(v, depth + 1, maxdepth, maxitems)
+                           for k, v in fields.items()
+                           if not k.startswith('_')}}
+    return {"$repr": _short_repr(value)}
+
+def _short_repr(value, limit=200):
+    try:
+        s = repr(value)
+    except Exception as e:
+        s = '<unprintable %s>' % type(e).__name__
+    return s if len(s) <= limit else s[:limit - 1] + '…'
+
+
 class StateQueue:
     """A queue that stores the state in order.
 
+    It also keeps the process' event log when traces are recorded: if
+    `events_stream` is given, every `event()` is written to it at once as one
+    line of JSON (see `DistProcess._record` for what is recorded).  The event
+    log is what `python -m da.replay` replays.
+
     """
 
-    def __init__(self, in_stream=None):
+    def __init__(self, in_stream=None, events_stream=None):
         self._in_file = in_stream
         self._states = []
+        self._events_file = events_stream
+        self._events_lock = threading.Lock()
+
+    @property
+    def records_events(self):
+        return self._events_file is not None
+
+    def event(self, record):
+        """Appends one event (a dict of JSON-compatible data) to the log."""
+        if self._events_file is None:
+            return
+        try:
+            line = json.dumps(record, default=_short_repr)
+        except Exception as e:
+            line = json.dumps({'kind': 'error', 'pid': record.get('pid'),
+                               'text': 'unrecordable event: %r' % e})
+        with self._events_lock:
+            if self._events_file is not None:
+                self._events_file.write(line + '\n')
+                self._events_file.flush()
 
     #
     # Custom serialization for objects inheriting from builtin types
@@ -814,6 +911,10 @@ class StateQueue:
         if self._in_file is not None:
             self._in_file.close()
             self._in_file = None
+        with self._events_lock:
+            if self._events_file is not None:
+                self._events_file.close()
+                self._events_file = None
 
 class ReplayQueue:
     """A queue that simply replays recorded messages in order.
