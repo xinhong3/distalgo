@@ -1014,6 +1014,7 @@ class ReplaySession:
             for c, (_, v, err) in zip(self.conditions,
                                       self.eval_conditions(states))]
         snap['conditionNames'] = self.condition_names(states)
+        snap['conditionExample'] = self.condition_example(states)
         if since and since.get('gen') == self.gen:
             # The history lists only grow with the step, so the page needs
             # only what it does not have yet; after a step back, only how
@@ -1198,6 +1199,37 @@ class ReplaySession:
         for cls in sorted({p.cls for p in T.procs.values() if not p.is_main}):
             scope[cls] = [v for v in allv if v.cls == cls]
         return scope
+
+    def condition_example(self, states=None):
+        """An example condition for this program, for the input's
+        placeholder: some(p in <a variable of main() holding processes>,
+        has= p.<field> == <its value now>), else over a process class."""
+        scope = self.query_scope(states)
+        groups = []
+        for name, v in scope.items():
+            if name in ('procs', 'network', 'step'):
+                continue
+            items = [v] if isinstance(v, ProcView) else (
+                list(v) if isinstance(v, (list, tuple, set, frozenset))
+                else [])
+            views = [x for x in items if isinstance(x, ProcView)]
+            if views:
+                is_class = name[:1].isupper()
+                groups.append((is_class, name, views))
+        groups.sort(key=lambda g: g[0])      # main()'s variables first
+        for _, name, views in groups:
+            for f, val in views[0].__dict__.items():
+                if isinstance(val, (bool, int, str)) and \
+                        f not in ('id', 'cls', 'status', 'clock'):
+                    var = name[0].lower() if name[0].isalpha() else 'p'
+                    if var == name:
+                        var = 'x'
+                    return 'some(%s in %s, has= %s.%s == %r)' % (
+                        var, name, var, f, val)
+        if groups:
+            return 'some(p in %s, has= p.status == %r)' % (
+                groups[0][1], groups[0][2][0].status)
+        return 'some(p in procs, has= len(p.received) > 0)'
 
     def condition_names(self, states=None):
         scope = self.query_scope(states)

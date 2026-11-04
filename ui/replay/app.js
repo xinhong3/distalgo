@@ -301,7 +301,7 @@ function renderConds() {
     const row = document.createElement('div');
     row.innerHTML = `<div class="cond">
         <input type="checkbox" ${c.enabled ? 'checked' : ''} title="Pause when this becomes true" aria-label="Enabled">
-        <input type="text" spellcheck="false" value="${esc(c.expr)}" placeholder="e.g. some(p in Pong, has= p.total_pings == 1)" aria-label="Condition">
+        <input type="text" spellcheck="false" value="${esc(c.expr)}" placeholder="e.g. ${esc(condExample())}" aria-label="Condition">
         <span class="val"></span>
         <button class="x" title="Remove condition" aria-label="Remove condition">×</button>
       </div><div class="cond-err"></div>`;
@@ -316,6 +316,11 @@ function renderConds() {
   if (names && names.length) {
     $('cond-names').innerHTML = names.map((n) => `<code>${esc(n)}</code>`).join(', ');
   }
+}
+function condExample() {
+  // built by the server from this program: a variable of main() holding
+  // processes, one of their fields and its value now
+  return (S.snap && S.snap.conditionExample) || 'some(p in procs, has= len(p.received) > 0)';
 }
 function paintCondValue(row, v) {
   const badge = row.querySelector('.val');
@@ -409,8 +414,9 @@ function toggleAuto() {
 async function startAuto() {
   S.auto = true;
   $('auto').classList.add('on');
-  const speed = $('speed').value;
-  if (speed !== 'steps') { await realTimeLoop(+speed); stopAuto(); return; }
+  const speed = playSpeed();
+  if (speed === null) { stopAuto(); return; }
+  if (speed !== 'steps') { await realTimeLoop(speed); stopAuto(); return; }
   while (S.auto) {
     const before = S.snap;
     if (!before.next) { setStatus('End of the recorded run.'); break; }
@@ -423,6 +429,16 @@ async function startAuto() {
     await sleep(REDUCED ? 350 : 750);
   }
   stopAuto();
+}
+/* 'steps', or how many times the recorded speed to play at (null: the
+   factor entered is not a positive number) */
+function playSpeed() {
+  const v = $('speed').value;
+  if (v === 'steps') return 'steps';
+  if (v !== 'x') return 1;
+  const f = parseFloat($('speed-x').value);
+  if (!(f > 0)) { setStatus('Enter how many times real time to play at, e.g. 0.25 or 2.', 'error'); return null; }
+  return f;
 }
 function stopAuto() {
   S.auto = false;
@@ -1040,6 +1056,8 @@ function renderWhy() {
         h += '<p>Its <code>run()</code> has finished.</p>';
       } else if (p.status === 'crashed') {
         h += `<p>It crashed: <code>${esc(p.error || '')}</code></p>`;
+      } else if (p.status === 'blocked' || p.status === 'running') {
+        h += '<p class="muted">Where it is in the code was not recorded for this step (traces recorded before the fix for programs under <code>da/</code> have no positions; record the run again).</p>';
       } else {
         h += '<p>It has not started running yet.</p>';
       }
@@ -1090,7 +1108,12 @@ function wire() {
     const d = e.target.closest('div[data-line]');
     if (d) toggleBreakpoint(+d.dataset.line);
   });
-  $('speed').addEventListener('change', () => { if (S.auto) stopAuto(); });
+  $('speed').addEventListener('change', () => {
+    if (S.auto) stopAuto();
+    $('speed-x-wrap').hidden = $('speed').value !== 'x';
+    if ($('speed').value === 'x') $('speed-x').focus();
+  });
+  $('speed-x').addEventListener('change', () => { if (S.auto) stopAuto(); });
   $('step').onclick = () => { stopAuto(); step(); };
   $('back').onclick = back;
   $('reset').onclick = reset;

@@ -23,14 +23,14 @@
     <button id="auto" title="Play the recorded steps one after another; pauses at breakpoints (space)" aria-label="Play">
       <svg class="i-play" viewBox="0 0 16 16"><path d="M4 2v12l10-6z"/></svg>
       <svg class="i-pause" viewBox="0 0 16 16"><path d="M3 2h4v12H3zM9 2h4v12H9z"/></svg></button>
-    <select id="speed" title="How Play moves: one step at a time, or at the speed the run was recorded" aria-label="Play speed">
+    <select id="speed" title="How Play moves: one step at a time, at the speed the run was recorded, or that speed times a factor" aria-label="Play speed">
       <option value="steps" selected>Play: step by step</option>
-      <option value="0.1">Play: 0.1× real time</option>
-      <option value="0.25">Play: 0.25× real time</option>
-      <option value="0.5">Play: 0.5× real time</option>
-      <option value="1">Play: 1× real time</option>
-      <option value="2">Play: 2× real time</option>
+      <option value="1">Play: real time</option>
+      <option value="x">Play: × real time</option>
     </select>
+    <label class="speed-x" id="speed-x-wrap" hidden title="Play at this many times the recorded speed (0.5 = half speed)">
+      <input id="speed-x" type="number" min="0.01" step="0.25" value="0.25" aria-label="Times real time"> ×
+    </label>
     <button id="until" title="Run until a breakpoint or condition" aria-label="Run to breakpoint">
       <svg viewBox="0 0 16 16"><path d="M1 2v12l7-6zM8 2v12l7-6z"/></svg></button>
   </nav>
@@ -63,6 +63,9 @@
       <div id="cond-list"></div>
       <p class="hint">A DistAlgo expression over the whole system, e.g.
         <code>some(a in acceptors, has= len(a.received) &gt; 5)</code>.
+        Every condition is checked after each step; <b>Run to breakpoint</b> and <b>Play</b> stop when any
+        checked condition <i>becomes</i> true (it was false before the step). To stop only when several things
+        hold at once, join them with <code>and</code> in one condition. Unchecked conditions still show their value.
         You can use <span id="cond-names">the variables of <code>main()</code>, <code>procs</code>, <code>network</code>, <code>step</code> and each process class</span>.
         Processes appear as objects with their fields plus <code>id</code>, <code>status</code>, <code>clock</code>,
         <code>received</code>, <code>sent</code> and <code>inbox</code>; the program's own helper functions work too.</p>
