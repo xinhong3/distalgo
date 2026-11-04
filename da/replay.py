@@ -1055,6 +1055,13 @@ class ReplaySession:
                 d['locals'] = {k: fmt(decode_value(v, T.pids))
                                for k, v in (fr.get('locals') or {}).items()}
                 frames.append(d)
+            if frames and s['waiting']:
+                # A blocked process is at its await: the compiler gives the
+                # blocking label call a nearby statement's line, so use the
+                # await's location (as its card does) for the innermost frame.
+                w = s['waiting']
+                frames[-1].update(block=w['block'], line=w['line'],
+                                  text=w['text'])
             procs.append({
                 'id': s['key'], 'cls': s['cls'], 'realId': pid,
                 'status': s['status'], 'isMain': s['main'],
