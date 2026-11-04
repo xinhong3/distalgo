@@ -1,0 +1,1282 @@
+'use strict';
+/* DistAlgo Live: front end.  Talks to server.py; all DistAlgo execution
+   happens there.  Drawing uses d3 (copied from DistAlgo's viz branch). */
+
+const $ = (id) => document.getElementById(id);
+const CLASS_COLORS = ['#1b8a7e', '#6a4bb3', '#b7770a', '#c0416b', '#3f6ea8',
+                      '#4f7a2a', '#8a5a44', '#2f8fb0', '#9b4dca', '#5c7a00'];
+const MSG_COLORS = ['#2459d6', '#c0416b', '#1b8a7e', '#b7770a', '#6a4bb3',
+                    '#4f7a2a', '#d0632a', '#8a5a44', '#2f8fb0', '#9b4dca'];
+const REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const NODE_R = 28;
+const CARD_W = 236;
+
+const S = {
+  blocks: [],          // {name, code, kind: 'process' | 'main' | 'code'}
+  active: 0,
+  bps: {},             // block name -> Set(line)
+  conds: [],           // {expr, enabled}
+  snap: null,
+  ranKey: null,        // code at the last run, to notice edits
+  sel: null,           // {type: 'proc', id} | {type: 'msg', key} | {type: 'change', i}
+  view: 'network',
+  auto: false,
+  error: null,         // {block, line} of a compile error
+  examples: [],
+  msgColors: {},
+  sweep: false,
+  lastLogCount: 0,
+};
+
+// ---------------------------------------------------------------- utilities
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+function trunc(s, n) { s = String(s); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+const HISTORY = ['events', 'logs', 'changes'];
+let chain = Promise.resolve();
+function call(path, body) {
+  const p = chain.then(() => {
+    body = Object.assign({}, body || {});
+    if (S.snap && path !== '/api/run') {
+      // ask only for history we do not have yet
+      body.since = { gen: S.snap.gen };
+      HISTORY.forEach((k) => { body.since[k] = S.snap[k].length; });
+    }
+    return fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then((r) => r.json()).then(mergeSnap);
+  });
+  chain = p.catch(() => {});
+  return p;
+}
+function mergeSnap(res) {
+  if (res && res.running && res.delta) {
+    if (S.snap && S.snap.gen === res.gen) {
+      HISTORY.forEach((k) => { res[k] = S.snap[k].concat(res[k]); });
+    }
+    res.delta = false;
+  }
+  return res;
+}
+function fmtTime(t) {
+  if (t == null) return '–';
+  return t < 1 ? `${(t * 1000).toFixed(t < 0.01 ? 1 : 0)} ms` : `${t.toFixed(3)} s`;
+}
+
+function classColor(cls) {
+  if (cls === 'main') return '#5d6b75';
+  const names = S.blocks.filter((b) => b.kind === 'process').map((b) => b.name);
+  let i = names.indexOf(cls);
+  if (i < 0 && S.snap) i = names.length + (S.snap.classes || []).indexOf(cls);
+  if (i < 0) i = [...cls].reduce((a, c) => a + c.charCodeAt(0), 0);
+  return CLASS_COLORS[i % CLASS_COLORS.length];
+}
+function msgType(payload) {
+  const m = /^\(*'([^']*)'/.exec(payload || '');
+  return m ? m[1] : trunc(payload || '?', 14);
+}
+function msgColor(payload) {
+  const t = msgType(payload);
+  if (!(t in S.msgColors)) {
+    S.msgColors[t] = MSG_COLORS[Object.keys(S.msgColors).length % MSG_COLORS.length];
+  }
+  return S.msgColors[t];
+}
+function locStr(loc) {
+  if (!loc) return '';
+  return (loc.block ? loc.block + ', ' : '') + 'line ' + loc.line;
+}
+function procById(id) {
+  return S.snap && S.snap.processes.find((p) => p.id === id);
+}
+function visibleProcs() {
+  if (!S.snap) return [];
+  return S.snap.processes.filter((p) =>
+    !(p.isMain && p.status === 'done' && p.sent === 0 && p.received === 0));
+}
+
+// ---------------------------------------------------------------- blocks
+const MAIN_TEMPLATE =
+`def main():
+    # Create processes with new(), pass arguments with setup(), then start() them.
+    pass
+`;
+function processTemplate(name) {
+  return `class ${name}(process):
+    def setup():
+        pass
+
+    def run():
+        pass
+
+    def receive(msg=('hello',), from_=p):
+        output('got hello from', p)
+`;
+}
+function kindOf(name, code) {
+  if (name === 'main') return 'main';
+  return /^\s*class\s+\w+\s*\([^)]*process[^)]*\)/m.test(code) ? 'process' : 'code';
+}
+function ensureMain() {
+  if (!S.blocks.some((b) => b.kind === 'main')) {
+    S.blocks.push({ name: 'main', code: MAIN_TEMPLATE, kind: 'main' });
+  }
+}
+function addProcess(name) {
+  name = name.trim();
+  if (!/^[A-Za-z_]\w*$/.test(name)) { setStatus('A process name must be a Python identifier, like Pong.', 'error'); return; }
+  if (S.blocks.some((b) => b.name === name)) { setStatus(`There is already a block named ${name}.`, 'error'); return; }
+  syncCode();
+  ensureMain();
+  const mainAt = S.blocks.findIndex((b) => b.kind === 'main');
+  S.blocks.splice(mainAt, 0, { name, code: processTemplate(name), kind: 'process' });
+  S.active = mainAt;
+  renderAll();
+  $('code').focus();
+}
+function removeBlock(i) {
+  syncCode();
+  const b = S.blocks[i];
+  S.blocks.splice(i, 1);
+  delete S.bps[b.name];
+  S.active = Math.max(0, Math.min(S.active, S.blocks.length - 1));
+  renderAll();
+  setStatus(`Removed ${b.name}.`, '', { undo: () => { S.blocks.splice(i, 0, b); S.active = i; renderAll(); } });
+}
+function codeKey() {
+  return JSON.stringify(S.blocks.map((b) => [b.name, b.code])) + '|' + $('argv').value +
+    '|' + $('delay').value + '|' + $('jitter').value;
+}
+function isStale() { return S.snap && S.ranKey !== codeKey(); }
+
+// ---------------------------------------------------------------- status
+function setStatus(text, kind, opts) {
+  const el = $('status');
+  el.className = 'status' + (kind ? ' ' + kind : '');
+  el.textContent = text || '';
+  if (opts && opts.undo) {
+    const a = document.createElement('a');
+    a.textContent = '  Undo';
+    a.href = '#';
+    a.style.color = 'var(--blue)';
+    a.onclick = (e) => { e.preventDefault(); opts.undo(); setStatus(''); };
+    el.appendChild(a);
+  }
+}
+
+// ---------------------------------------------------------------- tabs + editor
+function renderTabs() {
+  const tabs = $('tabs');
+  tabs.innerHTML = '';
+  const marks = computeMarks();
+  S.blocks.forEach((b, i) => {
+    const t = document.createElement('div');
+    t.className = 'tab' + (i === S.active ? ' on' : '') +
+      (i !== S.active && marks[b.name] && Object.keys(marks[b.name]).length ? ' has-mark' : '');
+    t.setAttribute('role', 'tab');
+    t.tabIndex = 0;
+    if (b.kind === 'process') {
+      const sw = document.createElement('span');
+      sw.className = 'swatch';
+      sw.style.background = classColor(b.name);
+      t.appendChild(sw);
+    }
+    const label = document.createElement('span');
+    label.textContent = b.name;
+    t.appendChild(label);
+    if (b.kind !== 'main') {
+      const x = document.createElement('button');
+      x.className = 'x';
+      x.title = `Remove ${b.name}`;
+      x.setAttribute('aria-label', `Remove ${b.name}`);
+      x.textContent = '×';
+      x.onclick = (e) => { e.stopPropagation(); removeBlock(i); };
+      t.appendChild(x);
+    }
+    t.onclick = () => setActive(i);
+    t.onkeydown = (e) => { if (e.key === 'Enter') setActive(i); };
+    tabs.appendChild(t);
+  });
+  const add = document.createElement('button');
+  add.className = 'tab add';
+  add.textContent = '+ Process';
+  add.title = 'Add a process (a server) and write its code';
+  add.onclick = () => showNewTab(add);
+  tabs.appendChild(add);
+}
+function showNewTab(btn) {
+  const box = document.createElement('div');
+  box.className = 'tab-new';
+  box.innerHTML = '<input placeholder="Process name" aria-label="Process name"><button class="small">Add</button>';
+  btn.replaceWith(box);
+  const inp = box.querySelector('input');
+  inp.focus();
+  const done = () => { if (inp.value.trim()) addProcess(inp.value); else renderTabs(); };
+  box.querySelector('button').onclick = done;
+  inp.onkeydown = (e) => { if (e.key === 'Enter') done(); if (e.key === 'Escape') renderTabs(); };
+}
+function syncCode() {
+  const b = S.blocks[S.active];
+  if (b) b.code = $('code').value;
+}
+function setActive(i, scrollLine) {
+  syncCode();
+  S.active = i;
+  const b = S.blocks[i];
+  $('code').value = b ? b.code : '';
+  renderTabs();
+  renderEditor();
+  if (scrollLine) scrollToLine(scrollLine);
+}
+function scrollToLine(line) {
+  const ta = $('code');
+  const lh = 20;
+  const top = (line - 1) * lh;
+  if (top < ta.scrollTop + lh || top > ta.scrollTop + ta.clientHeight - 2 * lh) {
+    ta.scrollTop = Math.max(0, top - ta.clientHeight / 3);
+  }
+  syncScroll();
+}
+function showBlock(blockName, line) {
+  const i = S.blocks.findIndex((b) => b.name === blockName);
+  if (i < 0) return;
+  if (i !== S.active) setActive(i, line);
+  else { renderEditor(); if (line) scrollToLine(line); }
+}
+
+/* Line highlights: {block: {line: class}} */
+function computeMarks() {
+  const marks = {};
+  const put = (loc, cls, rank) => {
+    if (!loc || !loc.block) return;
+    const m = (marks[loc.block] = marks[loc.block] || {});
+    const order = ['here2', 'here', 'mark', 'mark-line', 'err'];
+    if (!m[loc.line] || order.indexOf(cls) > order.indexOf(m[loc.line])) m[loc.line] = cls;
+  };
+  if (S.error) put(S.error, 'err');
+  if (!S.snap) return marks;
+  const sel = S.sel;
+  if (sel && sel.type === 'proc') {
+    const p = procById(sel.id);
+    if (p) {
+      p.frames.forEach((f, i) => put(f, i === p.frames.length - 1 ? 'here' : 'here2'));
+      if (p.pausedAt) put(p.pausedAt.line, 'here');
+    }
+  }
+  const why = selectedWhy();
+  if (why) {
+    put(why.line, 'mark-line');
+    (why.entries || []).forEach((e) => put(e, 'mark'));
+    (why.stack || []).slice(1).forEach((f) => put(f, 'mark'));
+    if (why.cause && why.cause.type === 'timer') (why.cause.setStack || []).forEach((f) => put(f, 'mark'));
+  }
+  return marks;
+}
+function procMarkers(blockName) {
+  // small colored ticks in the gutter: where each process currently is
+  const out = {};
+  if (!S.snap) return out;
+  visibleProcs().forEach((p) => {
+    const f = p.pausedAt ? p.pausedAt.line : (p.frames.length ? p.frames[p.frames.length - 1] : null);
+    if (f && f.block === blockName) (out[f.line] = out[f.line] || []).push(p);
+  });
+  return out;
+}
+function renderEditor() {
+  const b = S.blocks[S.active];
+  const hasBlocks = S.blocks.length > 0;
+  $('editor').style.display = hasBlocks ? '' : 'none';
+  $('empty').style.display = hasBlocks ? 'none' : '';
+  if (!b) return;
+  const code = $('code').value;
+  const lines = code.split('\n');
+  const bps = S.bps[b.name] || new Set();
+  const marks = computeMarks()[b.name] || {};
+  const pm = procMarkers(b.name);
+  const g = $('gutter');
+  const parts = [];
+  for (let i = 1; i <= lines.length; i++) {
+    let ticks = '';
+    (pm[i] || []).slice(0, 3).forEach((p, k) => {
+      ticks += `<i class="pm" style="background:${classColor(p.cls)};left:${2 + k * 3}px" title="${esc(p.id)} is here"></i>`;
+    });
+    parts.push(`<div data-line="${i}" class="${bps.has(i) ? 'bp' : ''}">${ticks}<span>${i}</span></div>`);
+  }
+  g.innerHTML = parts.join('');
+  const bd = $('backdrop');
+  bd.innerHTML = lines.map((l, i) => {
+    const cls = marks[i + 1] || '';
+    const sweep = S.sweep && cls === 'mark' ? ' sweep' : '';
+    return `<div class="${cls}${sweep}">${esc(l) || ' '}</div>`;
+  }).join('');
+  syncScroll();
+}
+function syncScroll() {
+  const ta = $('code');
+  $('backdrop').scrollTop = ta.scrollTop;
+  $('backdrop').scrollLeft = ta.scrollLeft;
+  $('gutter').scrollTop = ta.scrollTop;
+}
+function bpPayload() {
+  const out = {};
+  for (const k in S.bps) out[k] = [...S.bps[k]];
+  return out;
+}
+function toggleBreakpoint(line) {
+  const b = S.blocks[S.active];
+  if (!b) return;
+  const set = (S.bps[b.name] = S.bps[b.name] || new Set());
+  if (set.has(line)) set.delete(line); else set.add(line);
+  renderEditor();
+  sendBreakpoints();
+}
+
+let bpTimer = null;
+function sendBreakpoints() {
+  if (!S.snap) return;
+  clearTimeout(bpTimer);
+  bpTimer = setTimeout(pushBreakpoints, 250);
+}
+async function pushBreakpoints() {
+  bpTimer = null;
+  const res = await call('/api/breakpoints', { breakpoints: bpPayload(), conditions: S.conds });
+  if (res.running) { S.snap = res; renderConds(); }
+}
+function flushBreakpoints() {
+  // make sure the server has the latest breakpoints before time moves
+  if (bpTimer) { clearTimeout(bpTimer); return pushBreakpoints(); }
+  return Promise.resolve();
+}
+
+// ---------------------------------------------------------------- conditions
+function renderConds() {
+  const list = $('cond-list');
+  const vals = (S.snap && S.snap.conditions) || [];
+  if (document.activeElement && document.activeElement.closest &&
+      document.activeElement.closest('#cond-list')) {
+    // keep focus: only refresh the value badges
+    S.conds.forEach((c, i) => {
+      const row = list.children[i];
+      if (row) paintCondValue(row, vals[i]);
+    });
+    return;
+  }
+  list.innerHTML = '';
+  S.conds.forEach((c, i) => {
+    const row = document.createElement('div');
+    row.innerHTML = `<div class="cond">
+        <input type="checkbox" ${c.enabled ? 'checked' : ''} title="Pause when this becomes true" aria-label="Enabled">
+        <input type="text" spellcheck="false" value="${esc(c.expr)}" placeholder="e.g. some(p in Pong, has= p.total_pings == 1)" aria-label="Condition">
+        <span class="val"></span>
+        <button class="x" title="Remove condition" aria-label="Remove condition">×</button>
+      </div><div class="cond-err"></div>`;
+    const [chk, inp] = row.querySelectorAll('input');
+    chk.onchange = () => { c.enabled = chk.checked; sendBreakpoints(); };
+    inp.oninput = () => { c.expr = inp.value; sendBreakpoints(); };
+    row.querySelector('.x').onclick = () => { S.conds.splice(i, 1); renderConds(); sendBreakpoints(); };
+    paintCondValue(row, vals[i]);
+    list.appendChild(row);
+  });
+  const names = S.snap && S.snap.conditionNames;
+  if (names && names.length) {
+    $('cond-names').innerHTML = names.map((n) => `<code>${esc(n)}</code>`).join(', ');
+  }
+}
+function paintCondValue(row, v) {
+  const badge = row.querySelector('.val');
+  const err = row.querySelector('.cond-err');
+  badge.className = 'val';
+  err.textContent = '';
+  if (!v || !S.snap) { badge.textContent = '–'; return; }
+  if (v.error) { badge.textContent = 'error'; badge.classList.add('e'); err.textContent = v.error; }
+  else if (v.value === true) { badge.textContent = 'true'; badge.classList.add('t'); }
+  else if (v.value === false) { badge.textContent = 'false'; }
+  else badge.textContent = '–';
+}
+
+// ---------------------------------------------------------------- running
+async function run() {
+  stopAuto();
+  syncCode();
+  if (!S.blocks.length) { setStatus('Add a process or load an example first.', 'error'); return; }
+  ensureMain();
+  const stale = isStale();
+  const body = {
+    blocks: S.blocks.map((b) => ({ name: b.name, code: b.code })),
+    argv: $('argv').value,
+    delayMs: Math.max(0, +$('delay').value || 0),
+    jitterMs: Math.max(0, +$('jitter').value || 0),
+    keepPosition: stale && $('keep').checked,
+    breakpoints: bpPayload(),
+    conditions: S.conds,
+  };
+  const res = await call('/api/run', body);
+  if (res.error) {
+    S.error = res.where;
+    setStatus(res.error, 'error');
+    renderAll();
+    if (res.where) showBlock(res.where.block, res.where.line);
+    return;
+  }
+  S.error = null;
+  S.ranKey = codeKey();
+  S.sel = null;
+  S.msgColors = {};
+  S.lastLogCount = 0;
+  S.centerNet = true;
+  const [rep, tot] = res.replayed || [0, 0];
+  let msg = 'main() has run. Step forward to deliver messages, or set a breakpoint and run to it.';
+  if (tot) {
+    msg = `Re-ran your edited code and replayed ${rep} of ${tot} steps.` +
+      (rep < tot ? ' The remaining steps no longer happen with the new code.' : '');
+  }
+  setSnap(res, { status: msg });
+}
+
+async function step(action) {
+  if (!S.snap) return run();
+  await flushBreakpoints();
+  const res = await call('/api/step', action ? { action } : {});
+  setSnap(res, { animate: true });
+  return res;
+}
+async function back() {
+  if (!S.snap) return;
+  stopAuto();
+  setSnap(await call('/api/back'), {});
+}
+async function reset() {
+  if (!S.snap) return;
+  stopAuto();
+  setSnap(await call('/api/goto', { step: 0 }), { status: 'Back at step 0, right after main() ran.' });
+}
+async function goto(n) {
+  if (!S.snap) return;
+  stopAuto();
+  setSnap(await call('/api/goto', { step: n }), {});
+}
+async function runUntil() {
+  if (!S.snap) await run();
+  if (!S.snap) return;
+  stopAuto();
+  await flushBreakpoints();
+  const res = await call('/api/run_until', { maxSteps: 2000 });
+  setSnap(res, { status: stopText(res), kind: res.lastStop && res.lastStop.reason !== 'limit' && res.lastStop.reason !== 'quiet' ? 'stop' : '' });
+}
+function stopText(snap) {
+  const st = snap.lastStop;
+  if (!st) return '';
+  if (st.reason === 'line') {
+    const p = snap.processes.find((x) => x.id === snap.paused);
+    const at = p && p.pausedAt ? locStr(p.pausedAt.line) : '';
+    return `Paused at a breakpoint after ${st.steps} step${st.steps === 1 ? '' : 's'}: ${snap.paused} is at ${at}. Step forward to continue.`;
+  }
+  if (st.reason === 'condition') {
+    const exprs = st.ids.map((i) => snap.conditions[i] && snap.conditions[i].expr).filter(Boolean);
+    return `Paused after ${st.steps} step${st.steps === 1 ? '' : 's'}: ${exprs.join(' and ')} became true.`;
+  }
+  if (st.reason === 'quiet') return `Ran ${st.steps} steps. Nothing else can happen: every process is waiting or finished.`;
+  return `Ran ${st.steps} steps without reaching a breakpoint. Run again to keep going.`;
+}
+function toggleAuto() {
+  if (S.auto) { stopAuto(); return; }
+  if (!S.snap) { run().then(() => { if (S.snap) startAuto(); }); return; }
+  startAuto();
+}
+async function startAuto() {
+  S.auto = true;
+  $('auto').classList.add('on');
+  const speed = $('speed').value;
+  if (speed !== 'steps') { await realTimeLoop(+speed); stopAuto(); return; }
+  while (S.auto) {
+    const before = S.snap;
+    if (!before.next) { setStatus('Nothing else can happen: every process is waiting or finished.'); break; }
+    const res = await step();
+    if (!S.auto) break;
+    if (res.paused) { setStatus(stopText(Object.assign({}, res, { lastStop: { reason: 'line', steps: 1 } })), 'stop'); break; }
+    const hit = (res.conditions || []).filter((c, i) =>
+      c.enabled && c.value === true && !(before.conditions[i] && before.conditions[i].value === true));
+    if (hit.length) { setStatus(`Paused: ${hit.map((c) => c.expr).join(' and ')} became true.`, 'stop'); break; }
+    await sleep(REDUCED ? 350 : 750);
+  }
+  stopAuto();
+}
+function stopAuto() {
+  S.auto = false;
+  $('auto').classList.remove('on');
+}
+/* Real-time play: the virtual clock runs at `speed` x wall time while
+   playing, and stops when paused.  Messages arrive and timers fire by
+   themselves when their time comes. */
+async function realTimeLoop(speed) {
+  await flushBreakpoints();
+  let last = performance.now();
+  while (S.auto) {
+    await sleep(60);
+    if (!S.auto) break;
+    const now = performance.now();
+    const dt = Math.min(0.5, (now - last) / 1000) * speed;
+    last = now;
+    const prevStep = S.snap.step;
+    const res = await call('/api/advance', { dt });
+    if (!S.auto && !(res && res.lastStop)) { setSnap(res, {}); break; }
+    const st = res.lastStop;
+    if (st && (st.reason === 'line' || st.reason === 'condition')) {
+      setSnap(res, { status: stopText(res), kind: 'stop' });
+      break;
+    }
+    if (st && st.reason === 'quiet') {
+      setSnap(res, { status: 'Nothing else can happen: every process is waiting or finished, and no timer is pending.' });
+      break;
+    }
+    if (res.step === prevStep) quickRender(res);       // only the clock moved
+    else setSnap(res, { animate: false, realtime: true });
+  }
+}
+function quickRender(snap) {
+  S.snap = snap;
+  renderTime();
+  if (S.view === 'network') renderStage({});
+}
+
+function setSnap(snap, opts) {
+  opts = opts || {};
+  if (!snap || snap.error) { setStatus(snap ? snap.error : 'No answer from the server.', 'error'); return; }
+  if (!snap.running) return;
+  S.snap = snap;
+  if (S.sel && S.sel.type === 'change' && !snap.changes[S.sel.i]) S.sel = null;
+  if (S.sel && S.sel.type === 'proc' && !procById(S.sel.id)) S.sel = null;
+  if (S.sel && S.sel.type === 'msg' && !findMsg(S.sel.key)) S.sel = null;
+  if (snap.paused && !(S.sel && S.sel.type === 'proc' && S.sel.id === snap.paused)) {
+    // show the line the paused process is at
+    S.sel = { type: 'proc', id: snap.paused };
+    const p = procById(snap.paused);
+    if (p && p.pausedAt) {
+      const l = p.pausedAt.line;
+      const i = S.blocks.findIndex((b) => b.name === l.block);
+      if (i >= 0 && i !== S.active) { syncCode(); S.active = i; $('code').value = S.blocks[i].code; }
+      setTimeout(() => scrollToLine(l.line), 0);
+    }
+  }
+  if (opts.status !== undefined) setStatus(opts.status, opts.kind || '');
+  else setStatus(describeStep(snap), snap.paused ? 'stop' : '');
+  renderAll({ animate: opts.animate });
+}
+
+// ---------------------------------------------------------------- describing
+function describeAction(a, snap) {
+  if (!a) return '';
+  if (a.type === 'run') return `${a.pid} started running`;
+  if (a.type === 'timeout') return `the timeout of ${a.pid} fired`;
+  if (a.type === 'continue') return `${a.pid} continued from a breakpoint`;
+  if (a.type === 'timer') return `the timer ${a.id.split('~')[1] || ''} of ${a.id.split('~')[0]} fired`;
+  if (a.type === 'deliver') {
+    const m = findMsg(a.msg, snap);
+    if (!m) return 'a message was delivered';
+    const verb = m.dropped ? 'arrived but was dropped' : 'was delivered';
+    return `${m.payload} from ${m.src} ${verb} to ${m.dst}`;
+  }
+  return '';
+}
+function describeNext(snap) {
+  const a = snap.next;
+  if (!a) return 'nothing; every process is waiting or finished';
+  if (a.type === 'run') return `start ${a.pid}`;
+  if (a.type === 'timeout') return `timeout of ${a.pid}`;
+  if (a.type === 'continue') return `continue ${a.pid}`;
+  if (a.type === 'timer') {
+    const t = (snap.timers || []).find((x) => x.key === a.id);
+    return `timer of ${a.id.split('~')[0]} fires${t ? ' at ' + fmtTime(t.deadline) : ''}`;
+  }
+  const m = snap.network.find((x) => x.key === a.msg);
+  return m ? `deliver ${trunc(m.payload, 40)} from ${m.src} to ${m.dst}` : 'deliver a message';
+}
+function describeStep(snap) {
+  if (snap.paused) {
+    const p = procById(snap.paused);
+    return `${snap.paused} is paused at a breakpoint (${p && p.pausedAt ? locStr(p.pausedAt.line) : ''}). Step forward to let it continue.`;
+  }
+  if (snap.cursor === 0) return 'Step 0: main() has run and created the processes.';
+  const what = describeAction(snap.lastAction, snap);
+  return `Step ${snap.step}: ${what}.`;
+}
+function findMsg(key, snap) {
+  snap = snap || S.snap;
+  if (!snap) return null;
+  const send = snap.events.find((e) => e.kind === 'send' && e.key === key);
+  if (!send) return null;
+  const done = snap.events.find((e) => (e.kind === 'recv' || e.kind === 'drop') && e.key === key);
+  const fly = snap.network.find((m) => m.key === key);
+  return {
+    key, src: send.src, dst: send.dst, payload: send.payload, why: send.why,
+    sentStep: send.step, recvStep: done ? done.step : null,
+    dropped: done && done.kind === 'drop', inFlight: !!fly, arrives: fly ? fly.arrives : null,
+  };
+}
+function selectedWhy() {
+  const sel = S.sel;
+  if (!sel || !S.snap) return null;
+  if (sel.type === 'msg') { const m = findMsg(sel.key); return m && m.why; }
+  if (sel.type === 'change') { const c = S.snap.changes[sel.i]; return c && c.why; }
+  return null;
+}
+
+// ---------------------------------------------------------------- render all
+function renderAll(opts) {
+  opts = opts || {};
+  renderTabs();
+  renderEditor();
+  renderConds();
+  renderTime();
+  renderStage(opts);
+  renderLog();
+  renderWhy();
+  const r = $('run');
+  r.textContent = !S.snap ? 'Run' : isStale() ? 'Re-run' : 'Restart';
+  r.classList.toggle('stale', !!isStale());
+  ['reset', 'back', 'step', 'until'].forEach((id) => { $(id).disabled = !S.snap && id !== 'step' && id !== 'until'; });
+  if (S.snap) {
+    $('back').disabled = S.snap.cursor === 0 && !S.snap.paused;
+    $('step').disabled = !S.snap.next;
+  }
+}
+
+function renderTime() {
+  const sc = $('scrub');
+  const clk = $('clock');
+  if (!S.snap) { sc.max = 0; sc.value = 0; sc.disabled = true; clk.innerHTML = ''; return; }
+  sc.disabled = false;
+  sc.max = S.snap.cursor + S.snap.redo;
+  sc.value = S.snap.cursor;
+  clk.innerHTML = `<span>Step <b>${S.snap.step}</b> of ${S.snap.cursor + S.snap.redo}</span>
+    &nbsp;&nbsp; <span title="Virtual time: runs only while playing in real time">Time <b>${fmtTime(S.snap.time)}</b></span>
+    &nbsp;&nbsp; <span>Next: ${esc(describeNext(S.snap))}</span>`;
+}
+
+// ---------------------------------------------------------------- stage
+function renderStage(opts) {
+  const has = !!S.snap;
+  $('stage-empty').style.display = has ? 'none' : '';
+  $('net').style.display = has && S.view === 'network' ? '' : 'none';
+  $('timeline').hidden = !(has && S.view === 'timeline');
+  if (has) {
+    if (S.view === 'network') renderNet(opts);
+    else renderTimeline();
+  }
+  renderLegend();
+}
+function renderLegend() {
+  const el = $('legend');
+  el.innerHTML = Object.keys(S.msgColors).slice(0, 8).map((t) =>
+    `<span><i style="background:${S.msgColors[t]}"></i>${esc(t)}</span>`).join('');
+}
+
+function netSize(n, stage) {
+  if (n <= 4) {
+    return { W: Math.max(stage.clientWidth, 2 * (CARD_W + 70) + 260),
+             H: Math.max(stage.clientHeight, 360), compact: false };
+  }
+  // many processes: compact cards around a larger ellipse
+  const ry = Math.max(170, n * 26);
+  const fit = (stage.clientWidth - 2 * (CARD_W + 50)) / 2;
+  const rx = n <= 8 ? Math.max(200, fit) : Math.max(260, ry * 1.55);
+  return { W: Math.max(stage.clientWidth, 2 * rx + 2 * (CARD_W + 50)),
+           H: Math.max(stage.clientHeight, 2 * ry + 200), compact: true, rx, ry };
+}
+function layout(procs, W, H, size) {
+  const n = procs.length;
+  const pos = {};
+  const cx = W / 2, cy = H / 2;
+  const rx = size && size.rx ? size.rx : Math.max(150, W / 2 - CARD_W - 70);
+  const ry = size && size.ry ? size.ry : Math.max(110, H / 2 - 120);
+  procs.forEach((p, i) => {
+    let a;
+    if (n === 1) { pos[p.id] = { x: cx, y: cy, a: 0 }; return; }
+    if (n === 2) a = i === 0 ? Math.PI : 0;
+    else a = -Math.PI / 2 + (2 * Math.PI * i) / n + (n % 2 ? 0 : Math.PI / n);
+    pos[p.id] = { x: cx + rx * Math.cos(a), y: cy + ry * Math.sin(a), a };
+  });
+  return pos;
+}
+function curve(a, b, bend) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const ux = dx / len, uy = dy / len;
+  const sx = a.x + ux * (NODE_R + 3), sy = a.y + uy * (NODE_R + 3);
+  const ex = b.x - ux * (NODE_R + 9), ey = b.y - uy * (NODE_R + 9);
+  const mx = (sx + ex) / 2 - uy * bend, my = (sy + ey) / 2 + ux * bend;
+  return { d: `M${sx},${sy} Q${mx},${my} ${ex},${ey}`, lx: (sx + 2 * mx + ex) / 4, ly: (sy + 2 * my + ey) / 4 };
+}
+
+function renderNet(opts) {
+  const procs = visibleProcs();
+  const stage = $('stage');
+  const n = procs.length;
+  const size = netSize(n, stage);
+  const W = size.W, H = size.H;
+  const pos = layout(procs, W, H, size);
+  const svg = d3.select('#netsvg').attr('width', W).attr('height', H);
+  $('net').style.width = W + 'px';
+  $('net').style.height = H + 'px';
+  svg.selectAll('*').remove();
+
+  const defs = svg.append('defs');
+  const markerFor = (color) => {
+    const id = 'ah' + color.replace('#', '');
+    if (defs.select('#' + id).empty()) {
+      defs.append('marker').attr('id', id).attr('markerUnits', 'userSpaceOnUse')
+        .attr('markerWidth', 12).attr('markerHeight', 12).attr('viewBox', '0 0 12 12')
+        .attr('refX', 6).attr('refY', 6).attr('orient', 'auto')
+        .append('path').attr('d', 'M2,2 L10,6 L2,10 L6,6 L2,2').attr('fill', color); // viz-branch arrow
+    }
+    return `url(#${id})`;
+  };
+
+  // all-to-all network
+  const mesh = svg.append('g');
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+    const a = pos[procs[i].id], b = pos[procs[j].id];
+    mesh.append('line').attr('class', 'mesh').attr('x1', a.x).attr('y1', a.y).attr('x2', b.x).attr('y2', b.y);
+  }
+
+  // just delivered (this step): ghost arrows
+  const snap = S.snap;
+  const recent = snap.events.filter((e) => (e.kind === 'recv' || e.kind === 'drop') && e.step === snap.step && snap.cursor > 0);
+  const ghosts = svg.append('g');
+  recent.forEach((e) => {
+    if (!pos[e.src] || !pos[e.dst]) return;
+    const c = curve(pos[e.src], pos[e.dst], 26);
+    ghosts.append('path').attr('class', 'ghost').attr('d', c.d)
+      .attr('stroke', msgColor(e.payload)).attr('marker-end', markerFor(msgColor(e.payload)));
+  });
+
+  // in-flight messages, grouped by channel
+  const groups = new Map();
+  snap.network.forEach((m) => {
+    const k = m.src + '>' + m.dst;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(m);
+  });
+  const selKey = S.sel && S.sel.type === 'msg' ? S.sel.key : null;
+  const nextKey = snap.next && snap.next.type === 'deliver' ? snap.next.msg : null;
+  const mg = svg.append('g');
+  groups.forEach((ms) => {
+    const first = ms[0];
+    if (!pos[first.src] || !pos[first.dst]) return;
+    const c = curve(pos[first.src], pos[first.dst], 26);
+    const color = msgColor(first.payload);
+    const isNext = ms.some((m) => m.key === nextKey);
+    const g = mg.append('g').attr('class', 'msg' + (isNext ? ' next' : ''));
+    if (ms.some((m) => m.key === selKey)) g.append('path').attr('class', 'glow').attr('d', c.d);
+    g.append('path').attr('class', 'line').attr('d', c.d).attr('stroke', color)
+      .attr('stroke-dasharray', '6 4').attr('marker-end', markerFor(color));
+    g.append('path').attr('class', 'hit').attr('d', c.d);
+    g.append('text').attr('x', c.lx).attr('y', c.ly - 6).attr('text-anchor', 'middle').attr('fill', color)
+      .text(trunc(first.payload, 26) + (ms.length > 1 ? `  ×${ms.length}` : ''));
+    // where each message is on its way: (now - sent) / (arrives - sent)
+    const pathNode = g.append('path').attr('d', c.d).attr('fill', 'none').attr('stroke', 'none').node();
+    const L = pathNode.getTotalLength();
+    ms.forEach((m) => {
+      const span = (m.arrives - m.sentAt) || 1e-9;
+      const f = Math.max(0, Math.min(1, (snap.time - m.sentAt) / span));
+      const pt = pathNode.getPointAtLength(f * L);
+      g.append('circle').attr('class', 'inflight-dot').attr('r', 5).attr('fill', color)
+        .attr('cx', pt.x).attr('cy', pt.y);
+    });
+    const target = ms.find((m) => m.key === selKey) || ms[0];
+    g.on('click', () => {
+      if (d3.event.shiftKey) { hideTip(); step({ type: 'deliver', msg: target.key }); return; }
+      selectMsg(target.key);
+    });
+    g.on('mousemove', () => showTip(d3.event,
+      ms.map((m) => `${m.payload}   sent at step ${m.sentStep}, arrives at ${fmtTime(m.arrives)}`).join('\n') +
+      '\n\nClick to see why it was sent. Shift-click to deliver it now.'));
+    g.on('mouseleave', hideTip);
+  });
+
+  // nodes
+  const ng = svg.append('g');
+  procs.forEach((p) => {
+    const q = pos[p.id];
+    const sel = S.sel && S.sel.type === 'proc' && S.sel.id === p.id;
+    const g = ng.append('g').attr('class', `node ${p.status}${sel ? ' sel' : ''}`)
+      .attr('transform', `translate(${q.x},${q.y})`);
+    const ringColor = { blocked: '#9fb0a8', paused: '#2459d6', crashed: '#d33a2c', stuck: '#d33a2c', ready: '#b7770a' }[p.status];
+    if (ringColor || sel) {
+      g.append('circle').attr('class', 'ring').attr('r', NODE_R + 5)
+        .attr('stroke', sel ? '#2459d6' : ringColor)
+        .attr('stroke-dasharray', p.status === 'blocked' || p.status === 'ready' ? '4 3' : null);
+    }
+    g.append('circle').attr('class', 'body').attr('r', NODE_R).attr('fill', classColor(p.cls))
+      .on('click', () => selectProc(p.id))
+      .on('mousemove', () => showTip(d3.event, `${p.id}: ${p.status}\nClick to see the code it is running.`))
+      .on('mouseleave', hideTip);
+    const myTimers = (snap.timers || []).filter((x) => x.owner === p.id);
+    if (myTimers.length) {
+      const tb = g.append('g').attr('class', 'timer-badge').attr('transform', `translate(${NODE_R - 2},${-NODE_R + 2})`);
+      tb.append('circle').attr('r', 10);
+      const left = Math.min(...myTimers.map((x) => x.deadline)) - snap.time;
+      tb.append('text').attr('text-anchor', 'middle').attr('dy', 3.5)
+        .text(left >= 10 ? Math.round(left) : left >= 1 ? left.toFixed(1) : '<1');
+      tb.on('mousemove', () => showTip(d3.event, myTimers.map((x) =>
+        `timer (${x.interval}s) fires at ${fmtTime(x.deadline)}, in ${fmtTime(Math.max(0, x.deadline - snap.time))}`).join('\n')))
+        .on('mouseleave', hideTip);
+    }
+    const parts = p.id.split(':');
+    const t = g.append('text').attr('text-anchor', 'middle');
+    t.append('tspan').attr('x', 0).attr('dy', parts[1] ? -2 : 4).text(trunc(parts[0], 9));
+    if (parts[1]) t.append('tspan').attr('x', 0).attr('dy', 13).text(parts[1]);
+  });
+
+  // animate the messages delivered by this step
+  if (opts.animate && !REDUCED) {
+    recent.forEach((e) => {
+      if (!pos[e.src] || !pos[e.dst]) return;
+      const c = curve(pos[e.src], pos[e.dst], 26);
+      const path = ghosts.append('path').attr('d', c.d).attr('fill', 'none').attr('stroke', 'none');
+      const node = path.node();
+      const L = node.getTotalLength();
+      const dot = ghosts.append('circle').attr('r', 5).attr('fill', msgColor(e.payload));
+      dot.transition().duration(480).ease(d3.easeCubicInOut)
+        .attrTween('transform', () => (t) => {
+          const pt = node.getPointAtLength(t * L);
+          return `translate(${pt.x},${pt.y})`;
+        })
+        .transition().duration(200).attr('r', 0).remove();
+    });
+  }
+
+  renderCards(procs, pos, size.compact);
+  if (S.centerNet) {
+    // after a (re)start, scroll a large network so its middle is in view
+    S.centerNet = false;
+    stage.scrollLeft = Math.max(0, (W - stage.clientWidth) / 2);
+    stage.scrollTop = Math.max(0, (H - stage.clientHeight) / 2);
+  }
+}
+
+function renderCards(procs, pos, compact) {
+  const box = $('cards');
+  box.innerHTML = '';
+  const snap = S.snap;
+  procs.forEach((p) => {
+    const q = pos[p.id];
+    const card = document.createElement('div');
+    const sel = S.sel && S.sel.type === 'proc' && S.sel.id === p.id;
+    card.className = 'card' + (sel ? ' sel' : '') + (compact ? ' compact' : '');
+    const right = Math.cos(q.a) >= -0.01;
+    card.style.left = (right ? q.x + NODE_R + 14 : q.x - NODE_R - 14 - CARD_W) + 'px';
+    card.style.top = Math.max(4, q.y - 34) + 'px';
+
+    const changedNow = new Set(snap.changes.filter((c) => c.step === snap.step && c.pid === p.id).map((c) => c.field));
+    let at = '';
+    if (p.pausedAt) at = `paused at ${locStr(p.pausedAt.line)}: ${p.pausedAt.line.text}`;
+    else if (p.waitingAt) at = `waiting at ${locStr(p.waitingAt)}: ${p.waitingAt.text}`;
+    else if (p.status === 'ready') at = 'started; runs at the next step';
+    else if (p.status === 'setup' || p.status === 'created') at = 'created, not started';
+    const rows = Object.entries(p.state).map(([k, v]) =>
+      `<tr class="field${changedNow.has(k) ? ' changed' : ''}" data-field="${esc(k)}" title="Why does ${esc(k)} have this value?"><td class="k">${esc(k)}</td><td class="v">${esc(v)}</td></tr>`).join('');
+    const inner = p.frames.length ? p.frames[p.frames.length - 1] : null;
+    const locs = inner ? Object.entries(inner.locals) : [];
+    const localRows = locs.map(([k, v]) => `<tr><td class="k">${esc(k)}</td><td class="v">${esc(v)}</td></tr>`).join('');
+    card.innerHTML = `
+      <div class="head"><span class="name" style="color:${classColor(p.cls)}">${esc(p.id)}</span>
+        <span class="badge ${p.status}">${p.status}</span><span class="clk" title="Lamport clock">clock ${p.clock == null ? '–' : p.clock}</span></div>
+      ${at ? `<span class="at" title="${esc(at)}">${esc(at)}</span>` : ''}
+      ${rows ? `<table>${rows}</table>` : '<div class="sub">no fields</div>'}
+      ${localRows ? `<div class="sub">locals in ${esc(inner.func)}()</div><table>${localRows}</table>` : ''}
+      ${p.queue.length ? `<div class="sub">arrived, not yet handled</div><div class="inbox">${p.queue.map(esc).join('<br>')}</div>` : ''}
+      ${timerLines(snap, p.id)}
+      <div class="sub">sent ${p.sent}, received ${p.received}</div>`;
+    card.querySelector('.name').onclick = () => selectProc(p.id);
+    const atEl = card.querySelector('.at');
+    if (atEl) atEl.onclick = () => selectProc(p.id);
+    card.querySelectorAll('tr.field').forEach((tr) => {
+      tr.onclick = () => selectField(p.id, tr.dataset.field);
+    });
+    box.appendChild(card);
+  });
+}
+
+function timerLines(snap, pid) {
+  const ts = (snap.timers || []).filter((x) => x.owner === pid);
+  if (!ts.length) return '';
+  return '<div class="sub">timers</div><div class="timers">' + ts.map((x) =>
+    `${x.interval}s timer, fires in ${esc(fmtTime(Math.max(0, x.deadline - snap.time)))}`).join('<br>') + '</div>';
+}
+
+// timeline: the time-space diagram of the viz branch, built live
+function renderTimeline() {
+  const snap = S.snap;
+  const procs = visibleProcs();
+  const colW = 150, top = 46, rowH = 26, left = 70;
+  const x = {};
+  procs.forEach((p, i) => { x[p.id] = left + 40 + i * colW; });
+  const steps = snap.step + 1;
+  const W = Math.max($('stage').clientWidth, left + 80 + procs.length * colW);
+  const H = top + (steps + 1.5) * rowH + 20;
+  const y = (s) => top + s * rowH + 10;
+  const svg = d3.select('#tlsvg').attr('width', W).attr('height', H);
+  svg.selectAll('*').remove();
+  const defs = svg.append('defs');
+  const markerFor = (color) => {
+    const id = 'th' + color.replace('#', '');
+    if (defs.select('#' + id).empty()) {
+      defs.append('marker').attr('id', id).attr('markerUnits', 'userSpaceOnUse')
+        .attr('markerWidth', 12).attr('markerHeight', 12).attr('viewBox', '0 0 12 12')
+        .attr('refX', 9).attr('refY', 6).attr('orient', 'auto')
+        .append('path').attr('d', 'M2,2 L10,6 L2,10 L6,6 L2,2').attr('fill', color);
+    }
+    return `url(#${id})`;
+  };
+  for (let s = 0; s <= snap.step; s++) {
+    svg.append('text').attr('class', 'tl-step').attr('x', 12).attr('y', y(s) + 4).text('step ' + s);
+  }
+  svg.append('line').attr('class', 'tl-now').attr('x1', left).attr('x2', W - 10).attr('y1', y(snap.step)).attr('y2', y(snap.step));
+  procs.forEach((p) => {
+    svg.append('text').attr('class', 'tl-head').attr('x', x[p.id]).attr('y', 24).attr('text-anchor', 'middle')
+      .attr('fill', classColor(p.cls)).text(p.id).style('cursor', 'pointer').on('click', () => selectProc(p.id));
+    svg.append('line').attr('class', 'tl-col').attr('x1', x[p.id]).attr('x2', x[p.id])
+      .attr('y1', top - 8).attr('y2', y(snap.step) + rowH).attr('stroke', classColor(p.cls)).attr('opacity', 0.5);
+  });
+  const selKey = S.sel && S.sel.type === 'msg' ? S.sel.key : null;
+  const sends = snap.events.filter((e) => e.kind === 'send');
+  const ends = {};
+  snap.events.forEach((e) => { if (e.kind === 'recv' || e.kind === 'drop') ends[e.key] = e; });
+  sends.forEach((e) => {
+    if (x[e.src] == null || x[e.dst] == null) return;
+    const end = ends[e.key];
+    const color = msgColor(e.payload);
+    const x1 = x[e.src], y1 = y(e.step), x2 = x[e.dst];
+    const y2 = end ? y(end.step) : y(snap.step) + rowH * 0.75;
+    const cls = 'tl-msg' + (end ? (end.kind === 'drop' ? ' drop' : '') : ' fly');
+    if (e.key === selKey) svg.append('line').attr('class', 'tl-msg glow').attr('x1', x1).attr('y1', y1).attr('x2', x2).attr('y2', y2);
+    const ln = svg.append('line').attr('class', cls).attr('x1', x1).attr('y1', y1).attr('x2', x2).attr('y2', y2)
+      .attr('stroke', color).attr('marker-end', markerFor(color));
+    ln.on('click', () => selectMsg(e.key))
+      .on('mousemove', () => showTip(d3.event, `${e.payload}\n${e.src} to ${e.dst}, sent at step ${e.step}` +
+        (end ? `, ${end.kind === 'drop' ? 'dropped' : 'received'} at step ${end.step}` : ', still in flight')))
+      .on('mouseleave', hideTip);
+    svg.append('circle').attr('class', 'tl-dot').attr('cx', x1).attr('cy', y1).attr('r', 3).attr('fill', color)
+      .on('click', () => selectMsg(e.key));
+  });
+  snap.events.filter((e) => e.kind === 'timer' && x[e.pid] != null).forEach((e) => {
+    svg.append('rect').attr('class', 'tl-timer').attr('x', x[e.pid] - 6).attr('y', y(e.step) - 6)
+      .attr('width', 12).attr('height', 12).attr('transform', `rotate(45 ${x[e.pid]} ${y(e.step)})`)
+      .on('mousemove', () => showTip(d3.event, `${e.pid}: ${e.interval}s timer fired at step ${e.step}`))
+      .on('mouseleave', hideTip);
+  });
+  const tl = $('stage');
+  if (S.view === 'timeline') tl.scrollTop = tl.scrollHeight;
+}
+
+// ---------------------------------------------------------------- log
+function renderLog() {
+  const el = $('log');
+  if (!S.snap) { el.innerHTML = '<div class="row"><span></span><span></span><span class="t" style="color:var(--muted)">Logs from output(), print() and the runtime appear here.</span></div>'; return; }
+  const showSys = $('show-sys').checked;
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+  const rows = S.snap.logs.filter((l) => showSys || l.kind !== 'system').map((l) => {
+    const color = l.pid ? classColor(l.pid.split(':')[0]) : 'var(--muted)';
+    const now = l.step === S.snap.step && S.snap.cursor > 0 ? ' now' : '';
+    return `<div class="row ${l.kind}${now}"><span class="s">${l.step}</span><span class="p" style="color:${color}">${esc(l.pid || 'runtime')}</span><span class="t">${esc(l.text)}</span></div>`;
+  });
+  el.innerHTML = rows.join('');
+  if (atBottom || S.snap.logs.length !== S.lastLogCount) el.scrollTop = el.scrollHeight;
+  S.lastLogCount = S.snap.logs.length;
+}
+
+// ---------------------------------------------------------------- why panel
+function selectMsg(key) { S.sel = { type: 'msg', key }; S.sweep = true; jumpToWhy(selectedWhy()); renderAll(); S.sweep = false; }
+function selectChange(i) { S.sel = { type: 'change', i }; S.sweep = true; jumpToWhy(selectedWhy()); renderAll(); S.sweep = false; }
+function selectProc(id) {
+  S.sel = { type: 'proc', id };
+  const p = procById(id);
+  if (p) {
+    const at = p.pausedAt ? p.pausedAt.line : (p.frames.length ? p.frames[p.frames.length - 1] : null);
+    if (at && at.block) showBlock(at.block, at.line);
+  }
+  renderAll();
+}
+function selectField(pid, field) {
+  const ch = S.snap.changes;
+  for (let i = ch.length - 1; i >= 0; i--) {
+    if (ch[i].pid === pid && ch[i].field === field) return selectChange(i);
+  }
+  S.sel = { type: 'proc', id: pid };
+  renderAll();
+  $('why').insertAdjacentHTML('afterbegin',
+    `<p class="muted"><code>${esc(field)}</code> has not changed since <code>setup()</code> gave it its value.</p>`);
+}
+function jumpToWhy(why) {
+  if (!why) return;
+  const target = (why.entries && why.entries[0]) || why.line;
+  if (target && target.block) showBlock(target.block, target.line);
+}
+
+function codeLink(loc, cls) {
+  return `<li class="${cls || ''}" data-block="${esc(loc.block)}" data-line="${loc.line}">
+    <span class="loc">${esc(locStr(loc))}</span><code>${esc(loc.text)}</code></li>`;
+}
+function pathHtml(why) {
+  if (!why) return '';
+  let h = '<ul class="path">' + codeLink(why.line, 'self');
+  (why.entries || []).forEach((e) => { h += codeLink(e); });
+  (why.stack || []).slice(1).forEach((f) => { h += codeLink(f); });
+  if (why.cause && why.cause.type === 'timer') {
+    (why.cause.setStack || []).forEach((f) => { h += codeLink(f); });
+  }
+  return h + '</ul>';
+}
+function causeHtml(why, pid) {
+  const c = why && why.cause;
+  if (!c) return '';
+  if (c.type === 'handler') {
+    const b = c.bindings && Object.keys(c.bindings).length ?
+      ` with ${Object.entries(c.bindings).map(([k, v]) => `<code>${esc(k)} = ${esc(v)}</code>`).join(', ')}` : '';
+    return `<p>It ran inside the <code>receive</code> handler for <code>${esc(c.payload)}</code> from ${esc(c.src)}${b},
+      which arrived at step ${c.deliveredStep}. <a data-msg="${esc(c.msg)}">Why was that sent?</a></p>`;
+  }
+  if (c.type === 'timer') {
+    const set = c.set ? ` (<code>${esc(c.set.text)}</code>, ${esc(locStr(c.set))})` : '';
+    return `<p>It ran in a <code>Timer</code> callback. ${esc(pid)} started that ${c.interval}s timer at step ${c.setStep}${set},
+      and it fired ${c.interval}s later because nothing cancelled it first.</p>`;
+  }
+  const a = c.after;
+  const runName = pid === 'main' ? 'main()' : 'run()';
+  if (a && a.type === 'message') {
+    const w = a.await ? ` at <code>${esc(a.await.text)}</code> (${esc(locStr(a.await))})` : '';
+    return `<p>${runName} was waiting${w}. It continued once <code>${esc(a.payload)}</code> from ${esc(a.src)}
+      arrived at step ${a.deliveredStep}. <a data-msg="${esc(a.msg)}">Why was that sent?</a></p>`;
+  }
+  if (a && a.type === 'timeout') {
+    const w = a.await ? ` at <code>${esc(a.await.text)}</code> (${esc(locStr(a.await))})` : '';
+    return `<p>${runName} was waiting${w}. It continued because the timeout fired.</p>`;
+  }
+  return `<p>${runName} reached this line on its own after the process started; nothing had to arrive first.</p>`;
+}
+function renderWhy() {
+  const el = $('why');
+  const snap = S.snap;
+  if (!snap) {
+    el.innerHTML = '<p class="muted">After you run the program, select a message, a process or a field to see why it happened. The code that caused it is highlighted.</p>';
+    return;
+  }
+  const sel = S.sel;
+  let h = '';
+  if (sel && sel.type === 'msg') {
+    const m = findMsg(sel.key);
+    if (m) {
+      h += `<h3>Why did ${esc(m.src)} send <code>${esc(m.payload)}</code> to ${esc(m.dst)}?</h3>`;
+      if (m.why && m.why.cause && m.why.cause.type === 'timer') {
+        h += `<p>A timer callback of ${esc(m.src)} sent it at step ${m.sentStep}: <code>${esc(m.why.line.text)}</code>.</p>`;
+      } else {
+        h += `<p>${esc(m.src)} called <code>${esc(m.why ? m.why.line.text : 'send')}</code> at step ${m.sentStep}.</p>`;
+      }
+      h += causeHtml(m.why, m.src) + pathHtml(m.why);
+      if (m.inFlight) {
+        h += `<p class="muted">Still in flight; it would arrive at ${(m.arrives * 1000).toFixed(1)} ms.
+          <button class="small" data-deliver="${esc(m.key)}">Deliver it now</button></p>`;
+      } else {
+        h += `<p class="muted">${m.dropped ? 'Dropped' : 'Delivered'} at step ${m.recvStep}.</p>`;
+      }
+    }
+  } else if (sel && sel.type === 'change') {
+    const c = snap.changes[sel.i];
+    if (c) {
+      h += `<h3>Why did ${esc(c.pid)}.${esc(c.field)} change?</h3>`;
+      h += `<p><code>${esc(c.old == null ? '(unset)' : c.old)}</code> became <code>${esc(c.new)}</code> at step ${c.step},
+        by <code>${esc(c.why ? c.why.line.text : '')}</code>.</p>`;
+      h += causeHtml(c.why, c.pid) + pathHtml(c.why);
+      const older = snap.changes.map((x, i) => [x, i]).filter(([x, i]) => x.pid === c.pid && x.field === c.field && i < sel.i);
+      if (older.length) {
+        const [px, pi] = older[older.length - 1];
+        h += `<p class="muted"><a data-change="${pi}">Previous change</a>, at step ${px.step}.</p>`;
+      }
+    }
+  } else if (sel && sel.type === 'proc') {
+    const p = procById(sel.id);
+    if (p) {
+      h += `<h3>${esc(p.id)} is ${esc(p.status)}</h3>`;
+      if (p.frames.length) {
+        h += '<p class="muted">The code it is running, outermost first:</p><ul class="path here">';
+        p.frames.forEach((f) => {
+          h += `<li data-block="${esc(f.block)}" data-line="${f.line}"><span class="loc">${esc(f.func)}()</span><code>${esc(f.text)}</code></li>`;
+        });
+        h += '</ul>';
+      } else if (p.status === 'done') {
+        h += '<p>Its <code>run()</code> has finished. Messages sent to it are dropped.</p>';
+      } else {
+        h += '<p>It has not started running yet.</p>';
+      }
+      h += stepItems(snap, p.id);
+    }
+  } else {
+    h += `<h3>${snap.cursor === 0 ? 'Step 0' : 'Step ' + snap.step}</h3><p>${esc(describeStep(snap))}</p>`;
+    h += stepItems(snap, null);
+    h += '<p class="muted">Select a message arrow, a process, or a field in a process to see why it happened.</p>';
+  }
+  el.innerHTML = h;
+  el.querySelectorAll('[data-msg]').forEach((a) => { a.onclick = () => selectMsg(a.dataset.msg); });
+  el.querySelectorAll('[data-change]').forEach((a) => { a.onclick = () => selectChange(+a.dataset.change); });
+  el.querySelectorAll('[data-deliver]').forEach((b) => { b.onclick = () => step({ type: 'deliver', msg: b.dataset.deliver }); });
+  el.querySelectorAll('li[data-block]').forEach((li) => { li.onclick = () => showBlock(li.dataset.block, +li.dataset.line); });
+}
+function stepItems(snap, pid) {
+  const sends = snap.events.filter((e) => e.kind === 'send' && e.step === snap.step && (!pid || e.src === pid));
+  const changes = snap.changes.map((c, i) => [c, i]).filter(([c]) => c.step === snap.step && (!pid || c.pid === pid));
+  let h = '';
+  if (sends.length) {
+    h += '<p>Messages sent at this step:</p><ul class="items">' + sends.map((e) =>
+      `<li><a data-msg="${esc(e.key)}">${esc(e.src)} to ${esc(e.dst)}: <code>${esc(trunc(e.payload, 50))}</code></a></li>`).join('') + '</ul>';
+  }
+  if (changes.length) {
+    h += '<p>State changes at this step:</p><ul class="items">' + changes.map(([c, i]) =>
+      `<li><a data-change="${i}">${esc(c.pid)}.${esc(c.field)}: <code>${esc(trunc(c.old == null ? '(unset)' : c.old, 24))}</code> to <code>${esc(trunc(c.new, 24))}</code></a></li>`).join('') + '</ul>';
+  }
+  return h;
+}
+
+// ---------------------------------------------------------------- tooltip
+function showTip(ev, text) {
+  const t = $('tip');
+  t.textContent = text;
+  t.style.opacity = 1;
+  const x = Math.min(ev.clientX + 14, window.innerWidth - t.offsetWidth - 8);
+  t.style.left = x + 'px';
+  t.style.top = (ev.clientY + 14) + 'px';
+}
+function hideTip() { $('tip').style.opacity = 0; }
+
+// ---------------------------------------------------------------- examples
+async function loadExamples() {
+  const res = await fetch('/api/examples').then((r) => r.json());
+  S.examples = res.examples || [];
+  const sel = $('example');
+  const demo = document.createElement('optgroup');
+  demo.label = 'Demo';
+  const da = document.createElement('optgroup');
+  da.label = 'DistAlgo examples';
+  S.examples.forEach((ex, i) => {
+    const o = document.createElement('option');
+    o.value = i;
+    o.textContent = ex.name;
+    (ex.source === 'demo' ? demo : da).appendChild(o);
+  });
+  if (demo.children.length) sel.appendChild(demo);
+  if (da.children.length) sel.appendChild(da);
+}
+function loadExample(ex) {
+  stopAuto();
+  S.snap = null;          // a new program: the next Run starts fresh
+  S.ranKey = null;
+  S.blocks = ex.blocks.map((b) => ({ name: b.name, code: b.code, kind: kindOf(b.name, b.code) }));
+  ensureMain();
+  S.active = Math.max(0, S.blocks.findIndex((b) => b.kind === 'process'));
+  S.bps = {};
+  S.sel = null;
+  S.error = null;
+  $('argv').value = ex.argv || '';
+  $('code').value = S.blocks[S.active].code;
+  renderAll();
+  setStatus(`Loaded ${ex.name}. Press Run to start it.`);
+}
+
+// ---------------------------------------------------------------- wiring
+function wire() {
+  const ta = $('code');
+  ta.addEventListener('input', () => {
+    const b = S.blocks[S.active];
+    if (!b) return;
+    b.code = ta.value;
+    if (b.kind !== 'main') {
+      const m = /^\s*class\s+(\w+)/m.exec(b.code);
+      const nk = kindOf(b.name, b.code);
+      if (m && m[1] !== b.name && !S.blocks.some((x) => x !== b && x.name === m[1])) {
+        if (S.bps[b.name]) { S.bps[m[1]] = S.bps[b.name]; delete S.bps[b.name]; }
+        b.name = m[1];
+      }
+      b.kind = nk;
+    }
+    renderTabs();
+    renderEditor();
+    const r = $('run');
+    r.textContent = !S.snap ? 'Run' : isStale() ? 'Re-run' : 'Restart';
+    r.classList.toggle('stale', !!isStale());
+  });
+  ta.addEventListener('scroll', syncScroll);
+  ta.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); run(); return; }
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      document.execCommand('insertText', false, '    ');
+    } else if (e.key === 'Enter') {
+      const v = ta.value, i = ta.selectionStart;
+      const lineStart = v.lastIndexOf('\n', i - 1) + 1;
+      const line = v.slice(lineStart, i);
+      let indent = /^\s*/.exec(line)[0];
+      if (/:\s*$/.test(line)) indent += '    ';
+      e.preventDefault();
+      document.execCommand('insertText', false, '\n' + indent);
+    }
+  });
+  $('gutter').addEventListener('click', (e) => {
+    const d = e.target.closest('div[data-line]');
+    if (d) toggleBreakpoint(+d.dataset.line);
+  });
+  $('argv').addEventListener('input', () => renderAll());
+  $('delay').addEventListener('input', () => renderAll());
+  $('jitter').addEventListener('input', () => renderAll());
+  $('speed').addEventListener('change', () => { if (S.auto) stopAuto(); });
+  $('run').onclick = run;
+  $('step').onclick = () => { stopAuto(); step(); };
+  $('back').onclick = back;
+  $('reset').onclick = reset;
+  $('auto').onclick = toggleAuto;
+  $('until').onclick = runUntil;
+  $('scrub').addEventListener('change', (e) => goto(+e.target.value));
+  $('add-cond').onclick = () => { S.conds.push({ expr: '', enabled: true }); renderConds(); const ins = $('cond-list').querySelectorAll('input[type=text]'); ins[ins.length - 1].focus(); };
+  $('show-sys').onchange = renderLog;
+  $('example').onchange = (e) => {
+    const ex = S.examples[+e.target.value];
+    if (ex) loadExample(ex);
+    e.target.value = '';
+  };
+  $('add-first').onclick = () => { ensureMain(); renderAll(); showNewTab($('tabs').querySelector('.tab.add')); };
+  $('load-pingpong').onclick = () => {
+    const ex = S.examples.find((x) => x.name === 'pingpong' && x.source === 'demo') || S.examples[0];
+    if (ex) loadExample(ex);
+  };
+  document.querySelectorAll('.viewtabs button[data-view]').forEach((b) => {
+    b.onclick = () => {
+      S.view = b.dataset.view;
+      document.querySelectorAll('.viewtabs button[data-view]').forEach((x) => x.classList.toggle('on', x === b));
+      renderStage({});
+    };
+  });
+  $('why-toggle').onclick = () => {
+    const w = $('why-wrap');
+    const c = w.classList.toggle('collapsed');
+    $('why-toggle').textContent = c ? 'Show' : 'Hide';
+    $('why-toggle').setAttribute('aria-expanded', String(!c));
+  };
+  document.addEventListener('keydown', (e) => {
+    const tag = (e.target.tagName || '').toLowerCase();
+    if (tag === 'textarea' || tag === 'input' || tag === 'select') return;
+    if (e.key === 'ArrowRight') { e.preventDefault(); stopAuto(); step(); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); back(); }
+    else if (e.key === ' ') { e.preventDefault(); toggleAuto(); }
+    else if (e.key === 'Escape') { S.sel = null; renderAll(); }
+  });
+  window.addEventListener('resize', () => renderStage({}));
+}
+
+wire();
+renderAll();
+loadExamples().catch(() => setStatus('Could not reach the server. Is server.py running?', 'error'));

@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DistAlgo Live</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand">DistAlgo <span>Live</span></div>
+  <label class="ctl">
+    <span>Example</span>
+    <select id="example"><option value="">Load an example…</option></select>
+  </label>
+  <label class="ctl">
+    <span>Arguments</span>
+    <input id="argv" type="text" spellcheck="false" placeholder="e.g. 3 1" size="10">
+  </label>
+  <label class="ctl" title="How long every message takes to arrive (virtual time)">
+    <span>Delay</span>
+    <input id="delay" type="number" min="0" step="1" value="20" style="width:62px"> <span>ms</span>
+  </label>
+  <label class="ctl" title="Extra random delay per message, 0 to this many ms (seeded, so runs repeat)">
+    <span>±</span>
+    <input id="jitter" type="number" min="0" step="1" value="0" style="width:54px"> <span>ms</span>
+  </label>
+  <button id="run" class="primary" title="Compile the program and run main() (Ctrl+Enter)">Run</button>
+  <label class="check" title="When you re-run edited code, replay the same steps to get back to where you were">
+    <input id="keep" type="checkbox" checked> Keep my step on re-run
+  </label>
+  <div class="spacer"></div>
+  <nav class="transport" aria-label="Time controls">
+    <button id="reset" title="Back to the start (step 0)" aria-label="Reset">
+      <svg viewBox="0 0 16 16"><path d="M3 2h2v12H3zM14 2v12L6 8z"/></svg></button>
+    <button id="back" title="Step back (←)" aria-label="Step back">
+      <svg viewBox="0 0 16 16"><path d="M10 2v12L2 8zM14 2v12h-2V2z"/></svg></button>
+    <button id="step" title="Step forward (→)" aria-label="Step forward">
+      <svg viewBox="0 0 16 16"><path d="M6 2v12l8-6zM2 2h2v12H2z"/></svg></button>
+    <button id="auto" title="Play steps one after another; pauses at breakpoints (space)" aria-label="Play">
+      <svg class="i-play" viewBox="0 0 16 16"><path d="M4 2v12l10-6z"/></svg>
+      <svg class="i-pause" viewBox="0 0 16 16"><path d="M3 2h4v12H3zM9 2h4v12H9z"/></svg></button>
+    <select id="speed" title="How Play moves: one step at a time, or real time (the clock runs and pauses with Play)" aria-label="Play speed">
+      <option value="steps">Play: step by step</option>
+      <option value="0.1">Play: 0.1× real time</option>
+      <option value="0.25" selected>Play: 0.25× real time</option>
+      <option value="0.5">Play: 0.5× real time</option>
+      <option value="1">Play: 1× real time</option>
+      <option value="2">Play: 2× real time</option>
+    </select>
+    <button id="until" title="Run until a breakpoint or condition" aria-label="Run to breakpoint">
+      <svg viewBox="0 0 16 16"><path d="M1 2v12l7-6zM8 2v12l7-6z"/></svg></button>
+  </nav>
+</header>
+
+<div class="timebar">
+  <input id="scrub" type="range" min="0" max="0" value="0" aria-label="Step">
+  <div id="clock" class="clock"></div>
+</div>
+<div id="status" class="status" role="status"></div>
+
+<main class="layout">
+  <section class="left">
+    <div class="tabs" id="tabs" role="tablist"></div>
+    <div class="editor" id="editor">
+      <div class="gutter" id="gutter" title="Click a line number to set a breakpoint"></div>
+      <div class="code">
+        <pre class="backdrop" id="backdrop" aria-hidden="true"></pre>
+        <textarea id="code" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off"></textarea>
+      </div>
+    </div>
+    <div class="empty" id="empty">
+      <p>Add a process, write its DistAlgo code, then write <code>main()</code> to create and start processes.</p>
+      <p><button id="add-first">Add a process</button> <button id="load-pingpong">Load Ping-Pong</button></p>
+    </div>
+    <section class="conds">
+      <div class="panel-head">
+        <h2>Pause when</h2>
+        <button id="add-cond" class="small">Add condition</button>
+      </div>
+      <div id="cond-list"></div>
+      <p class="hint">A DistAlgo expression over the whole system, e.g.
+        <code>some(a in acceptors, has= len(a.received) &gt; 5)</code>.
+        You can use <span id="cond-names">the variables of <code>main()</code>, <code>procs</code>, <code>network</code>, <code>step</code> and each process class</span>.
+        Processes appear as objects with their fields plus <code>id</code>, <code>status</code>, <code>clock</code>,
+        <code>received</code>, <code>sent</code> and <code>inbox</code>; the program's own helper functions work too.</p>
+    </section>
+  </section>
+
+  <section class="right">
+    <div class="viewtabs">
+      <button data-view="network" class="on">Network</button>
+      <button data-view="timeline">Timeline</button>
+      <span class="legend" id="legend"></span>
+    </div>
+    <div class="stage" id="stage">
+      <div class="net" id="net">
+        <svg id="netsvg"></svg>
+        <div class="cards" id="cards"></div>
+      </div>
+      <div class="timeline" id="timeline" hidden><svg id="tlsvg"></svg></div>
+      <div class="stage-empty" id="stage-empty"><p>Press <b>Run</b> to start the program. Its processes appear here.</p></div>
+    </div>
+  </section>
+
+  <section class="bottom">
+    <div class="log-wrap">
+      <div class="panel-head">
+        <h2>Log</h2>
+        <label class="check"><input id="show-sys" type="checkbox" checked> Show runtime events</label>
+      </div>
+      <div class="log" id="log"></div>
+    </div>
+    <aside class="why" id="why-wrap">
+      <div class="panel-head">
+        <h2>Why?</h2>
+        <button id="why-toggle" class="small" aria-expanded="true">Hide</button>
+      </div>
+      <div class="why-body" id="why"></div>
+    </aside>
+  </section>
+</main>
+<div class="tip" id="tip"></div>
+<script src="d3.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
