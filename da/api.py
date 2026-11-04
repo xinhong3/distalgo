@@ -261,8 +261,13 @@ def entrypoint():
               issubclass(module.Node_, sim.DistProcess)):
         die("Main process is not a DistProcess: {}".format(module.Node_))
 
+    # config(visualize=True): record traces, then build the static viz page;
+    # config(visualize='replay'): record traces, then serve the replay page
+    # (da.replay) instead.  Any run with -T can be replayed later with
+    # `python -m da.replay LOGDIR`.
     trace_and_visualize = False
-    if 'visualize' in module.Node_._config_object and module.Node_._config_object['visualize']:
+    visualize = module.Node_._config_object.get('visualize')
+    if visualize:
         trace_and_visualize = True
         set_runtime_option('record_trace', True)
         os.makedirs(get_runtime_option('logdir'), exist_ok=True)
@@ -400,7 +405,15 @@ def entrypoint():
             log.error("Caught unexpected global exception: %r", e, exc_info=1)
             return 4
 
-    if trace_and_visualize:
+    if get_runtime_option('record_trace'):
+        print('Replay this run: python -m da.replay {}'.format(
+            get_runtime_option('logdir')))
+    if trace_and_visualize and isinstance(visualize, str) and \
+       visualize.casefold() == 'replay':
+        time.sleep(1)           # let child processes finish their logs
+        from . import replay
+        replay.serve(get_runtime_option('logdir'))
+    elif trace_and_visualize:
         time.sleep(3)
         specname = strip_suffix(get_runtime_option('file'))
         filename = specname + '.html'
