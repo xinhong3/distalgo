@@ -142,12 +142,12 @@ setup(name = "pyDistAlgo",
       ],
       include_package_data = True,
       package_data = {
-        'da.examples' : ['**/*.da']
+        'da.examples' : ['**/*.da'],
+        'da' : ['ui/css/*', 'ui/js/*', 'ui/*', 'ui/replay/*']
       },
 
       cmdclass = {
           'build_doc'   : CompileDocCommand,
-          'build'       : DABuildCommand,
           'build_py'    : DABuildPyCommand,
           'install_lib' : DAInstallCommand,
           'sdist'       : DASdistCommand,

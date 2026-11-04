@@ -83,6 +83,6 @@ recorded event: a send, output, `await`, `new`/`setup`/`start`, or the
   the HTTP server.  The value formatting, the code-around-a-line index and
   condition compiling are taken from DistAlgo Live (`livesim.py`), the server
   and its API from DistAlgo Live's `server.py`.
-* `ui/replay/`: DistAlgo Live's page (`app.js`, `style.css`, `index.html`),
+* `da/ui/replay/`: DistAlgo Live's page (`app.js`, `style.css`, `index.html`),
   with editing and running removed and loading a trace added; `d3.min.js` is
-  the viz branch's `ui/js/d3.min.js`.
+  the viz page's `da/ui/js/d3.min.js`.

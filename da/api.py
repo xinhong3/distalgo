@@ -22,6 +22,8 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+from pprint import pprint
+
 import os
 import sys
 import time
@@ -33,6 +35,8 @@ import urllib
 import webbrowser
 import json
 
+from datetime import datetime
+from pathlib import Path
 from string import Template
 from sys import stderr
 from . import common, sim, transport
@@ -225,13 +229,13 @@ def _load_main_module():
             die("Can not access source file %s" % target)
         # XXX: this differs from normal Python script-loading semantics:
         sys.path.insert(0, source_dir)
-        module = importlib.import_module(basename)
         sys.argv = [target] + get_runtime_option('args')
+        module = importlib.import_module(basename)
     elif get_runtime_option('module') is not None:
         module_args = get_runtime_option('module')
         module_name = module_args[0]
-        module = importlib.import_module(module_name)
         sys.argv = ['__main__'] + module_args[1:]
+        module = importlib.import_module(module_name)
     else:
         module = importlib.import_module(BASE_MODULE_NAME)
     return module
@@ -256,7 +260,7 @@ def entrypoint():
             # Just use the generic node:
             module.Node_ = sim.NodeProcess
         else:
-            die("Main process not defined!")
+            die("Warning: Main process not defined")
     elif not (type(module.Node_) is type and
               issubclass(module.Node_, sim.DistProcess)):
         die("Main process is not a DistProcess: {}".format(module.Node_))
@@ -267,11 +271,20 @@ def entrypoint():
     # `python -m da.replay LOGDIR`.
     trace_and_visualize = False
     visualize = module.Node_._config_object.get('visualize')
+    visualize_config = {}
     if visualize:
         trace_and_visualize = True
+
+        # visualize only works w/ lamport clocks for now
+        configobj = get_runtime_option('config')
+        configobj['clock'] = 'lamport'
+        set_runtime_option('config', configobj)
+
+        # enable trace option if not enabled, use a temp path
         set_runtime_option('record_trace', True)
         os.makedirs(get_runtime_option('logdir'), exist_ok=True)
-    # enable trace option if not enabled, use a temp path
+        if isinstance(visualize, dict):
+            visualize_config = visualize
 
     # Start main program
     nodename = _check_nodename()
@@ -406,12 +419,17 @@ def entrypoint():
             return 4
 
     replay_data = None
+    # this run's outputs are named like viz's page: <program>-<timestamp>
+    run_name = '{}-{}'.format(Path(get_runtime_option('file') or
+                                   'run').stem,
+                              datetime.now().strftime('%Y-%m-%d_%H%M%S'))
     if trace_and_visualize:
-        # Like viz's <program>.html: the whole run in one file for the
-        # replay, <program>.replay.json, written when the processes are done.
+        # Like viz's page: the whole run in one file for the replay,
+        # <program>-<timestamp>.replay.json, written when the processes are
+        # done.
         _wait_for_processes()
         from . import replay
-        replay_data = strip_suffix(get_runtime_option('file')) + '.replay.json'
+        replay_data = run_name + '.replay.json'
         try:
             replay.save(replay.collect(get_runtime_option('logdir')),
                         replay_data)
@@ -429,43 +447,46 @@ def entrypoint():
             replay.serve(replay_data)
     elif trace_and_visualize:
         time.sleep(3)
-        specname = strip_suffix(get_runtime_option('file'))
-        filename = specname + '.html'
+        specname = Path(get_runtime_option('file')).stem
+        filename = run_name + '.html'
 
-        ui_root = viz_file_path = "{}/ui".format(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        viz_uri = "file://{}/{}".format(os.getcwd(), filename)
-        viz_tmpl_path = "{}/index.tmpl.html".format(ui_root)
+        da_root = os.path.dirname(os.path.abspath(__file__))
+        ui_root = Path(da_root) / "ui"
+        viz_path = Path(os.getcwd()) / filename
+
         trace_dir = get_runtime_option('logdir') + '/'
 
         replacements = {
                 # css files
-                'bootstrap_css': open("{}/css/bootstrap.min.css".format(ui_root), 'r').read(),
-                'style_css': open("{}/css/style.css".format(ui_root), 'r').read(),
+                'bootstrap_css': open(ui_root / "css"/ "bootstrap.min.css", 'r').read(),
+                'style_css': open(ui_root / "css" / "style.css", 'r').read(),
 
                 # js files
-                'd3_js': open("{}/js/d3.min.js".format(ui_root), 'r').read(),
-                'jquery_js': open("{}/js/jquery-3.3.1.min.js".format(ui_root), 'r').read(),
-                'app_js': open("{}/js/app.js".format(ui_root), 'r').read(),
+                'd3_js': open(ui_root / "js" / "d3.min.js", 'r').read(),
+                'jquery_js': open(ui_root / "js"/ "jquery-3.3.1.min.js", 'r').read(),
+                'app_js': open(ui_root / "js" / "app.js", 'r').read(),
 
                 # spec name
                 'specname': specname,
 
                 # trace data
                 'tracedata' : trace_to_clocks_and_state(trace_dir),
+
+                # visualization config
+                'visualize_config': json.dumps(visualize_config)
             }
 
-        with open(viz_tmpl_path, 'r') as fin, open(filename, 'w+') as fout:
+        with open(ui_root / "index.tmpl.html", 'r') as fin, open(filename, 'w+') as fout:
             vizdata = fin.read()
             # replace placeholder with trace data
             vizdata = Template(vizdata).substitute(replacements)
             fout.write(vizdata)
 
         print('Visualization: {}\nTraces: {} \n'.format(
-            viz_uri,
+            viz_path.as_uri(),
             trace_dir))
 
-        webbrowser.open(viz_uri)
+        webbrowser.open(viz_path.as_uri())
 
     return 0
 

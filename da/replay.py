@@ -48,7 +48,7 @@ import io
 from da.compiler import utils as dautils
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-UI_ROOT = os.path.join(os.path.dirname(HERE), 'ui')
+UI_ROOT = os.path.join(HERE, 'ui')          # da/ui, next to the viz page
 STATIC = os.path.join(UI_ROOT, 'replay')
 STEP_KINDS = ('run', 'recv', 'timeout')
 MAIN = 'main'

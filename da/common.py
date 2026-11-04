@@ -41,9 +41,9 @@ from inspect import Parameter
 from functools import wraps
 
 MAJOR_VERSION = 1
-MINOR_VERSION = 1
+MINOR_VERSION = 2
 PATCH_VERSION = 0
-PRERELEASE_VERSION = "b12"
+PRERELEASE_VERSION = "b2"
 
 __version__ = "{}.{}.{}{}".format(MAJOR_VERSION, MINOR_VERSION, PATCH_VERSION,
                                    PRERELEASE_VERSION)
@@ -80,6 +80,9 @@ builtin_registry = dict()
 internal_registry = dict()
 
 class InvalidStateException(RuntimeError): pass
+
+class ConfigurationError(RuntimeError): pass
+
 
 def get_runtime_option(key, default=None):
     """Returns the configured value of runtime option 'key', or 'default' if 'key'
@@ -119,6 +122,45 @@ def _parse_items(items):
             subs[parts[0]] = parts[1]
     return subs
 
+def _set_hostname():
+    """Sets a canonical hostname for this process.
+
+    The "hostname" global option serves three distinct purposes within DistAlgo:
+    1) it determines the network interface(s) on which DistAlgo listens for
+    incoming messages; 2) it is a component of the globally unique `ProcessId`
+    used to identify DistAlgo processes; 3) during message routing, the
+    "hostname" component of the target `ProcessId` is used to determine the
+    proper forwarding path. Therefore, we must ensure that all DistAlgo
+    processes in a distributed network use the same hostname string for each
+    physical host in the network, or else message loss may occur.
+
+    """
+    import socket
+
+    hostname = GlobalOptions.get('hostname')
+    if hostname is None:
+        if len(GlobalOptions['nodename']) > 0:
+            hostname = socket.getfqdn()
+        else:
+            hostname = 'localhost'
+
+    try:
+        GlobalOptions['hostname'] = socket.gethostbyname(hostname)
+    except socket.error as e:
+        if GlobalOptions.get('hostname') is None:
+            msg = (f'This system is configured to use "{hostname}" as its fully '
+                   'qualified domain name, but it is not resolvable. Please '
+                   'specify a hostname or an IP address via the "--hostname"'
+                   '(or equivalently "-H") command line argument. If you only '
+                   'intend to connect to other DistAlgo nodes running on '
+                   'this system, you can use "-H localhost". Otherwise, '
+                   'you must specify a hostname or an IP address that is '
+                   'reachable from remote hosts.')
+        else:
+            msg = f'"{hostname}" is not a resolvable hostname.'
+        raise ConfigurationError(msg) from e
+
+
 def initialize_runtime_options(options=None):
     """Sets and sanitizes runtime options.
 
@@ -126,24 +168,16 @@ def initialize_runtime_options(options=None):
     names to corresponding values.
 
     """
+    import multiprocessing
+
+    from . import compiler
+
     global GlobalOptions
+
     if not GlobalOptions:
         GlobalOptions = dict()
     if options:
         GlobalOptions.update(options)
-
-    # Canonize hostname, essential for properly determining whether a ProcessId
-    # is running on the local machine:
-    if GlobalOptions.get('nodename') is None:
-        GlobalOptions['nodename'] = ''
-    import socket
-    if GlobalOptions.get('hostname') is None:
-        if len(GlobalOptions['nodename']) > 0:
-            GlobalOptions['hostname'] = socket.getfqdn()
-        else:
-            GlobalOptions['hostname'] = 'localhost'
-    GlobalOptions['hostname'] \
-        = socket.gethostbyname(GlobalOptions['hostname'])
 
     # Parse '--substitute-classes' and '--substitute-modules':
     GlobalOptions['substitute_classes'] = \
@@ -151,15 +185,18 @@ def initialize_runtime_options(options=None):
     GlobalOptions['substitute_modules'] = \
                             _parse_items(GlobalOptions.get('substitute_modules'))
 
+    if GlobalOptions.get('nodename') is None:
+        GlobalOptions['nodename'] = ''
+
+    _set_hostname()
+
     # Configure multiprocessing package to use chosen semantics:
-    import multiprocessing
     startmeth = GlobalOptions.get('start_method')
     if startmeth != multiprocessing.get_start_method(allow_none=True):
         multiprocessing.set_start_method(startmeth)
 
     # Convert 'compiler_flags' to a namespace object that can be passed directly
     # to the compiler:
-    from . import compiler
     GlobalOptions['compiler_args'] \
         = compiler.ui.parse_compiler_args(
             GlobalOptions.get('compiler_flags', '').split())
@@ -167,7 +204,8 @@ def initialize_runtime_options(options=None):
     # Make sure the directory for storing trace files exists:
     if GlobalOptions.get('record_trace'):
         if 'logdir' not in GlobalOptions:
-            raise ValueError("'record_trace' enabled without setting 'logdir'")
+            raise ConfigurationError(
+                "'record_trace' enabled without setting 'logdir'")
         os.makedirs(GlobalOptions['logdir'], exist_ok=True)
 
 def set_global_config(props):
@@ -688,8 +726,8 @@ class WaitableQueue:
         self._num_waiting = 0
         if trace_files is not None:
             self._in_file, self._out_file = trace_files
-            self._in_dumper = ObjectDumper(self._in_file)
-            self._out_dumper = ObjectDumper(self._out_file)
+            self._in_dumper = ObjectDumper(self._in_file, protocol=3)
+            self._out_dumper = ObjectDumper(self._out_file, protocol=3)
             self.__pop = self.pop
             self.pop = self._pop_and_record
         else:

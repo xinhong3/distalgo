@@ -23,10 +23,13 @@
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 import sys
+import builtins
 from ast import *
 from itertools import chain
 from . import dast, symtab
 from .utils import printd, printw, printe
+
+from pprint import pprint
 
 OperatorMap = {
     dast.AddOp      : Add,
@@ -69,10 +72,26 @@ AggregateMap = {
     dast.SumExpr : "sum"
 }
 
+
+GenCompMap = {
+    dast.TupleCompExpr: "tuple",
+    dast.MinCompExpr: "min",
+    dast.MaxCompExpr: "max",
+    dast.SumCompExpr: "sum"
+}
+
 CONFIG_OBJECT_NAME = "_config_object"
 STATE_ATTR_NAME = "_state"
 ENTRYPOINT_NAME = "run"
 CATCHALL_PARAM_NAME = "rest_%d"
+
+# FIXME: is there a better way than hardcoding these?
+KnownUpdateMethods = {
+    "add", "append", "extend", "update",
+    "insert", "reverse", "sort",
+    "delete", "remove", "pop", "clear", "discard"
+}
+
 
 ########## Convenience methods for creating AST nodes: ##########
 
@@ -91,13 +110,21 @@ def pyName(name, ctx=None):
     return Name(name, Load() if ctx is None else ctx)
 
 def pyNone():
-    return NameConstant(None)
+    if sys.version_info < (3, 8):
+        return NameConstant(None)
+    else:
+        return Constant(None)
 
 def pyTrue():
-    return NameConstant(True)
+    if sys.version_info < (3, 8):
+        return NameConstant(True)
+    else:
+        return Constant(True)
 
 def pyFalse():
-    return NameConstant(False)
+    if sys.version_info < (3, 8):
+        return NameConstant(False)
+    return Constant(False)
 
 def pyNot(expr):
     ast = UnaryOp(Not(), expr)
@@ -195,15 +222,20 @@ def pyClassDef(name, bases=[], keywords=[], starargs=None,
 
 def pyFunctionDef(name, args=[], kwarg=None, body=[], decorator_list=[],
                   returns=None):
-    arglist = arguments(args=[arg(n, None) for n in args],
-                        vararg=None,
-                        varargannotation=None,
-                        kwonlyargs=[],
-                        kwarg=(arg(arg=kwarg, annotation=None)
-                               if kwarg is not None else None),
-                        kwargannotation=None,
-                        defaults=[],
-                        kw_defaults=[])
+    argdict = {
+        'args': [arg(n, None) for n in args],
+        'vararg': None,
+        'varargannotation': None,
+        'kwonlyargs': [],
+        'kwarg': (arg(arg=kwarg, annotation=None)
+                if kwarg is not None else None),
+        'kwargannotation': None,
+        'defaults': [],
+        'kw_defaults': []
+    }
+    if sys.version_info >= (3 ,8):
+        argdict['posonlyargs'] = []
+    arglist = arguments(**argdict)
     ast = FunctionDef(name, arglist, list(body), list(decorator_list), returns)
     return ast
 
@@ -237,6 +269,9 @@ def propagate_fields(node):
     """
     if hasattr(node, '_fields'):
         for f in node._fields:
+            # Since Python 3.8
+            if f == 'type_comment' and getattr(node,f,None) is None:
+                continue
             propagate_attributes(getattr(node, f), node)
     return node
 
@@ -354,6 +389,9 @@ class PythonGenerator(NodeVisitor):
         self.current_context = Load
 
         self.current_node = None
+        self.fromImportSet = set()  # a tuple of 2 or 3 elements, from _ import _[ as _]
+        self.importSet = set()      # a tuple of 1 or 2 elements, import _[ as _]
+
 
     def get_option(self, option, default=None):
         if hasattr(self.cmdline_args, option):
@@ -396,8 +434,9 @@ class PythonGenerator(NodeVisitor):
         if isinstance(node, dast.Statement):
             assert isinstance(res, list)
             # This is a statement block, propagate line number info:
-            copy_location(res[0], node)
-            propagate_attributes(node, res[0])
+            if len(res) > 0:
+                copy_location(res[0], node)
+                propagate_attributes(node, res[0])
             return res
         else:
             assert isinstance(res, AST)
@@ -447,7 +486,15 @@ class PythonGenerator(NodeVisitor):
         if node.nodecls is not None:
             body.extend(nodeproc)
         body.extend(self.postambles)
-        return [Module(body)]
+
+        importList = [Import([alias(t[0], t[1] if len(t)>1 else None)]) for t in self.importSet]
+        fromImportList = [ImportFrom(t[0], [alias(t[1], t[2] if len(t)>2 else None)], 0) for t in self.fromImportSet]
+        # print(importList,fromImportList)
+
+        if sys.version_info >= (3 ,8):
+            return [Module(importList+fromImportList+body, type_ignores=[])]
+        else:
+            return [Module(importList+fromImportList+body)]
 
     def generate_config(self, node):
         return Assign([pyName(CONFIG_OBJECT_NAME, Store())],
@@ -509,7 +556,10 @@ class PythonGenerator(NodeVisitor):
 
     def visit_Arguments(self, node):
         """Generates the argument lists for functions and lambdas."""
-        self.current_context = Param
+        if sys.version_info < (3, 9):
+            self.current_context = Param
+        else:
+            self.current_context = Load
         args = [arg(ident.name, None) for ident in node.args]
         kwonlyargs = [arg(ident.name, None) for ident in node.kwonlyargs]
         kw_defaults = [self.visit(expr) for expr in node.kw_defaults]
@@ -519,13 +569,18 @@ class PythonGenerator(NodeVisitor):
         kwarg = arg(node.kwarg.name, None) \
                 if node.kwarg is not None else None
         self.current_context = Load
-        return arguments(
-            args=args,
-            vararg=vararg,
-            kwonlyargs=kwonlyargs,
-            kwarg=kwarg,
-            defaults=defaults,
-            kw_defaults=kw_defaults)
+        argdict = {
+            'args': args,
+            'vararg': vararg,
+            'kwonlyargs': kwonlyargs,
+            'kwarg': kwarg,
+            'defaults': defaults,
+            'kw_defaults': kw_defaults
+        }
+        # Since Python 3.8
+        if sys.version_info >= (3, 8):
+            argdict['posonlyargs'] = []
+        return arguments(**argdict)
 
     def visit_Process(self, node):
         printd("Compiling process %s" % node.name)
@@ -624,13 +679,27 @@ class PythonGenerator(NodeVisitor):
         ctx = self.current_context
         self.current_context = Load
         val = self.visit(node.value)
-        if isinstance(node.index, dast.SliceExpr):
+        if isinstance(node.index, dast.SliceExpr) or isinstance(node.index, dast.ExtSliceExpr):
             idx = self.visit(node.index)
         else:
-            idx = Index(self.visit(node.index))
-            propagate_attributes([idx.value], idx)
+            if sys.version_info < (3, 9):
+                idx = Index(self.visit(node.index))
+                propagate_attributes([idx.value], idx)
+            else:
+                idx = self.visit(node.index)
         self.current_context = ctx
         return pySubscr(val, idx, ctx())
+
+    def visit_ExtSliceExpr(self,node):
+        dims = [self.visit(d) for d in node.dims]
+        if sys.version_info < (3, 9):
+            ast = ExtSlice(dims)
+        else:
+            ast = Tuple(dims, Load())
+        return propagate_attributes(dims, ast)
+
+    def visit_PythonExpr(self, node):
+        return node._ast
 
     def visit_SliceExpr(self, node):
         l = self.visit(node.lower) if node.lower is not None else None
@@ -648,15 +717,22 @@ class PythonGenerator(NodeVisitor):
         return propagate_attributes([val], ast)
 
     def visit_EllipsisExpr(self, node):
-        return Ellipsis()
+        if sys.version_info < (3, 8):
+            return Ellipsis()
+        else:
+            return Constant(builtins.Ellipsis)
 
     def visit_ConstantExpr(self, node):
-        if isinstance(node.value, str):
-            return Str(node.value)
-        elif isinstance(node.value, bytes):
-            return Bytes(node.value)
+        if sys.version_info < (3, 8):
+            if isinstance(node.value, str):
+                return Str(node.value)
+            elif isinstance(node.value, bytes):
+                return Bytes(node.value)
+            else:
+                return Num(node.value)
         else:
-            return Num(node.value)
+            # Since Python 3.8
+            return Constant(node.value)
 
     def visit_SelfExpr(self, node):
         return pyAttr("self", "_id")
@@ -741,6 +817,17 @@ class PythonGenerator(NodeVisitor):
     visit_MinExpr = visit_AggregateExpr
     visit_SumExpr = visit_AggregateExpr
     visit_SizeExpr = visit_AggregateExpr
+
+    def visit_ProdExpr(self, node):
+        #1. functools.reduce(operator.mul,lis)
+        #2. eval('*'.join(str(item) for item in list))
+        self.importSet.add(('functools',))
+        self.importSet.add(('operator',))
+        prod = pyCall(func=pyAttr("functools", "reduce"), args=[pyAttr("operator","mul"), self.visit(node.args[0])])
+        if len(node.args) > 1:
+            return propagate_fields(BinOp(self.visit(node.args[1]), Mult(), prod))
+        else:
+            return prod
 
     def visit_LogicalExpr(self, node):
         if node.operator is dast.NotOp:
@@ -896,8 +983,16 @@ class PythonGenerator(NodeVisitor):
                         ast = SetComp(elem, generators)
                     elif isinstance(node, dast.ListCompExpr):
                         ast = ListComp(elem, generators)
-                    elif isinstance(node, dast.TupleCompExpr):
-                        ast = pyCall("tuple", args=[GeneratorExp(elem, generators)])
+                    elif isinstance(node, dast.LenCompExpr):
+                        ast = pyCall("len", args=[ListComp(elem, generators)])
+                    elif type(node) in GenCompMap:
+                        ast = pyCall(GenCompMap[type(node)], args=[GeneratorExp(elem, generators)])
+                    elif isinstance(node, dast.PrdCompExpr):
+                        #1. functools.reduce(operator.mul,lis)
+                        #2. eval('*'.join(str(item) for item in list))
+                        self.importSet.add(('functools',))
+                        self.importSet.add(('operator',))
+                        ast = pyCall(func=pyAttr("functools", "reduce"), args=[pyAttr("operator","mul"), ListComp(elem, generators)])
                     elif isinstance(node, dast.GeneratorExpr):
                         ast = GeneratorExp(elem, generators)
                     else:
@@ -941,6 +1036,12 @@ class PythonGenerator(NodeVisitor):
     visit_ListCompExpr = visit_ComprehensionExpr
     visit_DictCompExpr = visit_ComprehensionExpr
     visit_TupleCompExpr = visit_ComprehensionExpr
+
+    visit_MinCompExpr = visit_ComprehensionExpr
+    visit_MaxCompExpr = visit_ComprehensionExpr
+    visit_SumCompExpr = visit_ComprehensionExpr
+    visit_PrdCompExpr = visit_ComprehensionExpr
+    visit_LenCompExpr = visit_ComprehensionExpr
 
     def visit_ComparisonExpr(self, node):
         left = self.visit(node.left)
@@ -1287,7 +1388,7 @@ class PythonGenerator(NodeVisitor):
             if item.asname is None:
                 names.append(alias(item.name, None))
             else:
-                names.append(alias(item.name, item.asname.name))
+                names.append(alias(item.name, item.asname))
         return [ImportFrom(node.module, names, node.level)]
 
     def visit_AssertStmt(self, node):
@@ -1390,6 +1491,11 @@ class PatternComprehensionGenerator(PythonGenerator):
         self.current_context = ctx
         return target
 
+    #### todo add extra condition to condition_list to fix number of components error
+    #### length of pattern and length of elements
+    #### when recursive visiting
+    #### remember the freevar seen.
+    ####    first time seen a variable: free, see it later: bound
     def visit_TuplePattern(self, node):
         condition_list = []
         targets = []

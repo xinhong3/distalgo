@@ -51,21 +51,29 @@ class TransportManager:
             self.__class__.log = logger.getChild(self.__class__.__name__)
 
     def __getstate__(self):
-        return (self.initialized, self.started, self.authkey)
+        return (self.queue, 
+                self.mesgloop,
+                self.transports, 
+                self.initialized, 
+                self.started, 
+                self.authkey)
 
     def __setstate__(self, state):
-        self.initialized, self.started, self.authkey = state
+        self.queue, self.mesgloop, self.transports, self.initialized, self.started, self.authkey = state
         if self.__class__.log is None:
             self.__class__.log = logger.getChild(self.__class__.__name__)
 
     @property
     def transport_addresses(self):
-        return tuple(t.address for t in self.transports)
+        return tuple(t.address if t is not None else None
+                     for t in self.transports)
 
     @property
     def transport_addresses_str(self):
-        return ", ".join(["{}={}".format(tr.__class__.__name__, tr.address)
-                        for tr in self.transports])
+        return ", ".join(["{}={}".format(typ.__name__,
+                                         tr.address
+                                         if tr is not None else "<None>")
+                          for typ, tr in zip(TransportTypes, self.transports)])
 
     def initialize(self, pipe=None, **params):
         """Initialize all transports.
@@ -73,13 +81,13 @@ class TransportManager:
         """
         self.log.debug("Initializing with key %r...", self.authkey)
         total = len(TransportTypes)
-        self.transports = tuple(cls(self.authkey) for cls in TransportTypes)
         cnt = 0
         res = []
-        for trsp in self.transports:
+        for cls in TransportTypes:
             try:
                 if pipe is not None:
-                    assert pipe.recv() is trsp.__class__
+                    assert pipe.recv() is cls
+                trsp = cls(self.authkey)
                 trsp.initialize(pipe=pipe, **params)
                 cnt += 1
                 res.append(trsp)
@@ -87,11 +95,11 @@ class TransportManager:
                 self.log.debug("Failed to initialize transport %s: %r",
                                transport, err, exc_info=1)
                 res.append(None)
-        self.transports = res
+        self.transports = tuple(res)
         if pipe:
             pipe.send('done')
         if cnt != total:
-            self.log.error(
+            self.log.warning(
                 "Initialization failed for {}/{} transports.".format(
                     (total - cnt), total))
         self.initialized = True
@@ -103,14 +111,14 @@ class TransportManager:
         self.log.debug("Starting...")
         self.queue = WaitableQueue()
         self.mesgloop = SelectorLoop()
-        total = len(TransportTypes)
-        cnt = 0
+        started, total = 0, 0
         res = []
         for trsp in self.transports:
             if trsp is not None:
+                total += 1
                 try:
                     trsp.start(self.queue, self.mesgloop)
-                    cnt += 1
+                    started += 1
                     res.append(trsp)
                 except Exception as err:
                     self.log.error("Failed to start transport %s: %r",
@@ -118,11 +126,12 @@ class TransportManager:
                     res.append(None)
             else:
                 res.append(None)
-        if cnt != total:
-            self.log.error(
+        if started != total:
+            self.log.warning(
                 "Start failed for {}/{} transports.".format(
-                    (total - cnt), total))
+                    (total - started), total))
         self.started = True
+        self.transports = tuple(res)
 
     def close(self):
         """Shut down all transports.

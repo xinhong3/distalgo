@@ -118,7 +118,7 @@ def build_clocks(trace_dir):
     for obj in data:
         if not obj:
             continue
-        process_map[obj['process']] = []
+        process_map[obj['process']] = set()
         pid_map[obj['process']] = process_idx
         m = re.match(r'<([^\:]+)\:([^\>]+)\>', obj['process'], re.M | re.I)
         process_info_map[process_idx] = [m.group(1), m.group(2), obj['process']]
@@ -135,29 +135,22 @@ def build_clocks(trace_dir):
             continue
         for msg in obj['messages']:
             if not msg['sender'].startswith('<Node_'):
-                process_map[msg['sender']].append(msg['clock'])
+                process_map[msg['sender']].add(msg['clock'])
 
     for p in data:
         if not p:
             continue
-        rcv_clk = 0
+        rcv_candidate = 0
         for msg in p['messages']:
+            # ignore messages from controller
             if msg['sender'].startswith('<Node_'):
                 continue
 
-            while rcv_clk in process_map[p['process']]:
-                rcv_clk += 1
+            rcv_candidate = max(rcv_candidate, msg['clock']) + 1
 
-            dtuple = (msg['sender'], msg['clock'])
-
-            clk = {}
-            clk[msg['sender']] = msg['clock']
-            rcv_candidate = max(rcv_clk, msg['clock'] + 1)
-
+            # skip clocks for which we know the process sent a message
             while rcv_candidate in process_map[p['process']]:
                 rcv_candidate += 1
-
-            clk[p['process']] = rcv_candidate
 
             results['messages'].append({
                 'msg': msg['payload'],
@@ -165,7 +158,8 @@ def build_clocks(trace_dir):
                 'receiver': [pid_map[p['process']], rcv_candidate]
             })
 
-            results['maxClock'] = max(results['maxClock'], rcv_candidate, )
+            results['maxClock'] = max(results['maxClock'], rcv_candidate)
+
     return results
 
 
