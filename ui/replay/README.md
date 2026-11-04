@@ -10,24 +10,37 @@ or threads, real messages), recorded, then replayed.
 
 ## Use
 
-Record a run, then replay it:
+Like viz, a recorded run is replayed from **one data file**,
+`<program>.replay.json`: the event logs of all its processes and the
+program's source, so the file is all the replay needs (it can be moved or
+sent to someone; the `.da` file and the log directory are not needed).
 
-    python -m da -T --logdir mytrace ping.da          # -T = --record-trace
-    python -m da.replay mytrace                      # opens http://localhost:8642
+    python -m da ping.da              # with config(visualize=True) in main()
+    python -m da.replay ping.replay.json            # opens http://localhost:8642
 
-or put `config(visualize='replay')` in `main()` (it turns on recording and
-serves the replay when the run ends).  `config(visualize=True)` still makes
-the static viz page; every recorded run prints the `da.replay` command that
-replays it.
+With `config(visualize=True)` the run writes `ping.replay.json` (next to
+viz's `ping.html`) once all its processes have ended; with
+`config(visualize='replay')` it writes it and serves the replay right away
+(no viz page).  A run recorded only with `-T` (`--record-trace`) can be
+replayed from its log directory, or merged into a data file first:
 
-Options: `python -m da.replay LOGDIR [--port 8642] [--no-browser]`.
+    python -m da -T --logdir mytrace ping.da
+    python -m da.replay mytrace                     # merged when loaded
+    python -m da.replay mytrace --save ping.replay.json
+
+Options: `python -m da.replay DATA [--port 8642] [--no-browser]`.
+
+The data file is JSON: `{"format": "distalgo-replay", "version": 1,
+"program": <main .da file>, "sources": {file: text}, "processes": {process
+id: [event, ...]}, ...}`, the events as described below.
 
 ## What is recorded
 
 With trace recording on, every process writes `<process>.events` in the log
 directory (next to the `.trace`, `.snd` and `.state` files), one JSON line
 per event, written as it happens (so a run that is stopped can still be
-replayed):
+replayed); they are merged into the data file at the end, as viz merges the
+`.trace` and `.state` files into its page:
 
 | event | when | data |
 |---|---|---|

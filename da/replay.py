@@ -1,16 +1,22 @@
 """Replay a recorded DistAlgo run in the browser.
 
-    python -m da.replay LOGDIR [--port 8642] [--no-browser]
+    python -m da.replay DATA [--port 8642] [--no-browser]
+    python -m da.replay LOGDIR --save DATA        # only write the data file
 
-LOGDIR is the directory a run recorded its traces in: run a program with
-`-T`/`--record-trace` (and `--logdir LOGDIR`), or with `config(visualize=...)`
-which turns recording on.  Besides the `.trace`/`.snd`/`.state` files, every
-process then writes an event log, `<process>.events` (see
-`DistProcess._record` in sim.py).  This module turns those logs into a
-sequence of steps and serves a page that steps through them forwards and
-backwards, in a network view and a time-space (timeline) view, explains each
-message and state change with the code that caused it, and pauses when a
-condition (a DistAlgo expression over the whole system) becomes true.
+A recorded run is replayed from one data file, `<program>.replay.json`
+(like viz's one `<program>.html`): all processes' event logs plus the
+program's source, so the file is all the replay needs.  A run with
+`config(visualize=...)` writes it when the run ends; for a run recorded with
+`-T`/`--record-trace` (and `--logdir LOGDIR`), give LOGDIR instead of DATA
+(its logs are merged when loaded) or write the file with `--save`.
+
+While recording, every process writes an event log, `<process>.events`,
+next to its `.trace`/`.snd`/`.state` files (see `DistProcess._record` in
+sim.py).  This module turns those logs into a sequence of steps and serves a
+page that steps through them forwards and backwards, in a network view and a
+time-space (timeline) view, explains each message and state change with the
+code that caused it, and pauses when a condition (a DistAlgo expression over
+the whole system) becomes true.
 
 A step is one activation of one process: a process starts running, handles
 one delivered message, or has an `await` time out; everything it does until
@@ -274,16 +280,22 @@ def split_blocks(lines):
 class SourceMap:
     """The program files a trace refers to, split into named blocks."""
 
-    def __init__(self, files):
+    def __init__(self, files, sources=None):
+        """`sources`: {file: source text} (from the data file); a file not
+        in it is read from disk."""
         self.files = {}           # file -> {'lines', 'blocks', 'headers'}
         self.blocks = []          # [{'name', 'code', 'kind', 'file', 'start'}]
+        self.text = {}            # file -> source text
+        sources = sources or {}
         multi = len(files) > 1
         for fn in files:
-            try:
-                with open(fn) as f:
-                    src = f.read().replace('\r\n', '\n').replace('\t', '    ')
-            except OSError:
+            src = sources.get(fn)
+            if src is None:
+                src = _read_source(fn)
+            if src is None:
                 continue
+            src = src.replace('\r\n', '\n').replace('\t', '    ')
+            self.text[fn] = src
             lines = src.split('\n')
             if lines and lines[-1] == '':
                 lines.pop()
@@ -367,6 +379,102 @@ class SourceMap:
 
 
 # --------------------------------------------------------------------------
+# The data file: one recorded run in one file
+# --------------------------------------------------------------------------
+
+DATA_FORMAT = 'distalgo-replay'
+DATA_VERSION = 1
+
+
+def _read_source(fn):
+    try:
+        with open(fn) as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _source_files(processes):
+    """The program's source files that the events refer to."""
+    files = set()
+    for evs in processes.values():
+        for e in evs:
+            for fr in e.get('frames') or ():
+                files.add(fr['file'])
+            c = e.get('cause') or {}
+            if c.get('file'):
+                files.add(c['file'])
+            if e.get('file'):
+                files.add(e['file'])
+    return {f for f in files if f}
+
+
+def collect(logdir):
+    """One recorded run as one data dict: every process' event log (the
+    `<process>.events` files in `logdir`) and the source of the program
+    files they refer to (the way viz.trace_to_clocks_and_state collects a
+    run's traces for its page)."""
+    files = sorted(glob.glob(os.path.join(logdir, '*.events')))
+    if not files:
+        raise ValueError(
+            'no event logs (*.events) in %s: record a run with -T '
+            '(--record-trace) using this version of DistAlgo' % logdir)
+    processes = {}
+    for fn in files:
+        evs = []
+        with open(fn) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        evs.append(json.loads(line))
+                    except ValueError:
+                        pass           # a line cut off when the run stopped
+        if evs:
+            processes[evs[0]['pid']] = evs
+    program = next((e.get('file') for evs in processes.values() for e in evs
+                    if e['kind'] == 'run' and e.get('main')), None)
+    sources = {}
+    for fn in _source_files(processes):
+        text = _read_source(fn)
+        if text is not None:
+            sources[fn] = text
+    return {'format': DATA_FORMAT, 'version': DATA_VERSION,
+            'program': program,
+            'logdir': os.path.abspath(logdir),
+            'recorded': min((evs[0].get('t', 0) for evs in processes.values()),
+                            default=None),
+            'sources': sources,
+            'processes': processes}
+
+
+def save(data, path):
+    with open(path, 'w') as f:
+        json.dump(data, f, separators=(',', ':'))
+    return path
+
+
+def load(path):
+    """The data of a recorded run, from a data file or a log directory."""
+    if os.path.isdir(path):
+        data = collect(path)
+    else:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or data.get('format') != DATA_FORMAT:
+            raise ValueError('%s is not a DistAlgo replay data file' % path)
+    data['path'] = os.path.abspath(path)
+    return data
+
+
+def data_file_name(program):
+    """`<program>.replay.json` in the current directory (where viz writes
+    `<program>.html`)."""
+    base = os.path.splitext(os.path.basename(program or 'run'))[0]
+    return base + '.replay.json'
+
+
+# --------------------------------------------------------------------------
 # The recorded run
 # --------------------------------------------------------------------------
 
@@ -399,47 +507,27 @@ class Message:
 
 
 class Trace:
-    """All event logs of one run, ordered into steps."""
+    """All event logs of one run (a data file, see `collect`), ordered into
+    steps."""
 
-    def __init__(self, logdir):
-        self.logdir = logdir
-        files = sorted(glob.glob(os.path.join(logdir, '*.events')))
-        if not files:
-            raise ValueError(
-                'no event logs (*.events) in %s: record a run with -T '
-                '(--record-trace) using this version of DistAlgo' % logdir)
+    def __init__(self, data):
+        self.data = data
         self.procs = {}
-        for fn in files:
-            evs = []
-            with open(fn) as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            evs.append(json.loads(line))
-                        except ValueError:
-                            pass       # a line cut off when the run stopped
+        for pid, evs in data['processes'].items():
             if evs:
-                evs.sort(key=lambda e: e.get('seq', 0))
-                self.procs[evs[0]['pid']] = Proc(evs[0]['pid'], evs)
+                evs = sorted(evs, key=lambda e: e.get('seq', 0))
+                self.procs[pid] = Proc(pid, evs)
+        if not self.procs:
+            raise ValueError('the recorded run has no events')
         self._name_processes()
         self._segment()
         self._order()
         self._messages()
-        sources = []
-        for p in self.procs.values():
-            for e in p.events:
-                for fr in e.get('frames') or ():
-                    sources.append(fr['file'])
-                c = e.get('cause') or {}
-                if c.get('file'):
-                    sources.append(c['file'])
-            if p.file:
-                sources.append(p.file)
-        main = next((p.file for p in self.procs.values() if p.is_main), None)
-        files = sorted(set(f for f in sources if f),
+        main = data.get('program') or next(
+            (p.file for p in self.procs.values() if p.is_main), None)
+        files = sorted(_source_files(data['processes']),
                        key=lambda f: (f != main, f))
-        self.src = SourceMap(files)
+        self.src = SourceMap(files, data.get('sources'))
         self.main_file = main
 
     # ---- naming: Cls:1, Cls:2, ... in creation order; main() is 'main'
@@ -655,8 +743,8 @@ class ReplaySession:
 
     HISTORY = ('events', 'logs', 'changes')
 
-    def __init__(self, logdir):
-        self.trace = Trace(logdir)
+    def __init__(self, path):
+        self.trace = Trace(load(path))
         self.src = self.trace.src
         self.cursor = 0
         self.gen = 1
@@ -1032,7 +1120,7 @@ class ReplaySession:
 
     def info(self):
         T = self.trace
-        return {'logdir': os.path.abspath(T.logdir),
+        return {'logdir': T.data.get('path'),
                 'program': T.main_file,
                 'steps': len(T.steps),
                 'processes': len(T.procs),
@@ -1150,12 +1238,13 @@ class ReplaySession:
         conditions.  main() is not run."""
         self.namespace = {}
         fn = self.trace.main_file
-        if not fn or not os.path.exists(fn):
+        src = self.src.text.get(fn) if fn else None
+        if src is None:
             return
         try:
             args = daui.parse_compiler_args([])
             with _quiet_compiler(io.StringIO()):
-                code = daui.dafile_to_pycode(fn, args)
+                code = daui.dastr_to_pycode(src, fn, args)
                 ns = {'__name__': '__dareplay__', '__file__': fn}
                 if code is not None:
                     exec(code, ns)
@@ -1397,16 +1486,17 @@ class Handler(BaseHTTPRequestHandler):
         self._json(res)
 
 
-def serve(logdir, port=8642, open_browser=True):
-    """Serves the replay of the run recorded in `logdir` until Ctrl-C."""
+def serve(path, port=8642, open_browser=True):
+    """Serves the replay of a recorded run (a data file or a log
+    directory) until Ctrl-C."""
     global SESSION
-    SESSION = ReplaySession(logdir)
+    SESSION = ReplaySession(path)
     server = HTTPServer(('127.0.0.1', port), Handler)
     url = 'http://localhost:%d/' % port
     T = SESSION.trace
     print('DistAlgo Replay: %d steps, %d processes, %d messages from %s' %
           (len(T.steps), len(T.procs), len(T.messages),
-           os.path.abspath(logdir)))
+           os.path.abspath(path)))
     print('Open %s   (Ctrl-C to stop)' % url)
     if open_browser:
         try:
@@ -1425,14 +1515,24 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         prog='python -m da.replay',
         description='Replay a recorded DistAlgo run in the browser.')
-    ap.add_argument('logdir', help='directory with the recorded traces '
-                    '(the --logdir of a run with -T/--record-trace)')
+    ap.add_argument('data', help='the data file of a recorded run '
+                    '(<program>.replay.json), or the directory with its '
+                    'traces (the --logdir of a run with -T/--record-trace)')
+    ap.add_argument('--save', metavar='FILE', help='only merge the run into '
+                    'one data file FILE (from a log directory), do not serve')
     ap.add_argument('--port', type=int, default=8642)
     ap.add_argument('--no-browser', action='store_true')
     args = ap.parse_args(argv)
     try:
-        serve(args.logdir, args.port, not args.no_browser)
-    except ValueError as e:
+        if args.save:
+            data = load(args.data)
+            data.pop('path', None)
+            save(data, args.save)
+            print('Wrote %s (%d processes)' % (args.save,
+                                                len(data['processes'])))
+            return
+        serve(args.data, args.port, not args.no_browser)
+    except (ValueError, OSError) as e:
         sys.exit(str(e))
 
 

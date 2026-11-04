@@ -405,14 +405,28 @@ def entrypoint():
             log.error("Caught unexpected global exception: %r", e, exc_info=1)
             return 4
 
-    if get_runtime_option('record_trace'):
+    replay_data = None
+    if trace_and_visualize:
+        # Like viz's <program>.html: the whole run in one file for the
+        # replay, <program>.replay.json, written when the processes are done.
+        _wait_for_processes()
+        from . import replay
+        replay_data = strip_suffix(get_runtime_option('file')) + '.replay.json'
+        try:
+            replay.save(replay.collect(get_runtime_option('logdir')),
+                        replay_data)
+            print('Replay data: {}\nReplay: python -m da.replay {}'.format(
+                replay_data, replay_data))
+        except (ValueError, OSError) as e:
+            log.error("Could not write the replay data: %r", e)
+            replay_data = None
+    elif get_runtime_option('record_trace'):
         print('Replay this run: python -m da.replay {}'.format(
             get_runtime_option('logdir')))
     if trace_and_visualize and isinstance(visualize, str) and \
        visualize.casefold() == 'replay':
-        time.sleep(1)           # let child processes finish their logs
-        from . import replay
-        replay.serve(get_runtime_option('logdir'))
+        if replay_data is not None:
+            replay.serve(replay_data)
     elif trace_and_visualize:
         time.sleep(3)
         specname = strip_suffix(get_runtime_option('file'))
@@ -454,6 +468,21 @@ def entrypoint():
         webbrowser.open(viz_uri)
 
     return 0
+
+def _wait_for_processes():
+    """Waits until the program's processes have ended, so their event logs
+    are complete (Ctrl-C stops waiting)."""
+    import multiprocessing
+    import threading
+    try:
+        for p in multiprocessing.active_children():
+            p.join()
+        for t in threading.enumerate():
+            if isinstance(t, sim.OSThreadContainer) and \
+               t is not threading.current_thread():
+                t.join()
+    except KeyboardInterrupt:
+        pass
 
 def dump_traces(traces):
     if not traces:
