@@ -814,17 +814,25 @@ class ReplaySession:
     def _why(self, pid, e, step, frames=None):
         frames = frames if frames is not None else e.get('frames')
         cause = e.get('cause')
+        stack = self._frames_locs(frames)
         if frames:
             fr = frames[0]
             line = self.src.loc(fr['file'], fr['line'])
             entries = self.src.entry_chain(fr['file'], fr['line'])
+            awaits = [i for i, d in enumerate(entries) if d['kind'] == 'await']
+            if e['kind'] in ('await', 'handler') and awaits:
+                # at an await's label: the label call has a nearby line
+                entries = entries[awaits[0]:]
+                line = {k: v for k, v in entries[0].items() if k != 'kind'}
+                stack[0] = dict(stack[0], line=line['line'],
+                                text=line['text'])
         elif cause and cause.get('type') == 'handler' and cause.get('file'):
             line = self.src.loc(cause['file'], cause['line'])
             entries = []
         else:
             line, entries = None, []
         return {'line': line or {'block': None, 'line': None, 'text': ''},
-                'entries': entries, 'stack': self._frames_locs(frames),
+                'entries': entries, 'stack': stack,
                 'cause': self._cause(pid, cause, e['seq']), 'step': step}
 
     # ---- history (events, changes, logs), computed once ---------------
@@ -832,20 +840,18 @@ class ReplaySession:
         T = self.trace
         events, changes, logs = [], [], []
         self._step_lines = []                 # step -> set of (file, line)
-        last_state = {}
+        last_state = {}                       # pid -> fields so far
         for k, st in enumerate(T.steps):
             pid = st['pid']
             p = T.procs[pid]
             lines = set()
-            if k == 0 or pid not in last_state:
-                for e in p.pre:
-                    if e.get('state') is not None:
-                        last_state[pid] = e['state']
+            if pid not in last_state:
+                last_state[pid] = self._setup_state(pid)
             for e in st['events']:
                 kind = e['kind']
                 for fr in (e.get('frames') or ())[:1]:
                     lines.add((fr['file'], fr['line']))
-                if kind == 'handler':
+                if kind == 'handled':
                     c = e.get('cause') or {}
                     if c.get('file'):
                         lines.add((c['file'], c['line']))
@@ -893,30 +899,34 @@ class ReplaySession:
                 if kind == 'setupcall':
                     # the children's setup() ran now
                     for c in e.get('procs', []):
-                        cp = T.procs.get(c)
-                        if cp is None:
-                            continue
-                        for ce in cp.pre:
-                            if ce['kind'] == 'setup' and \
-                                    ce.get('state') is not None:
-                                last_state[c] = ce['state']
-                if e.get('state') is not None:
-                    old = last_state.get(pid, {})
-                    new = e['state']
-                    if old != new:
+                        last_state[c] = self._setup_state(c)
+                if e.get('state'):
+                    # the fields changed since the process' last event: by
+                    # the handler that just ran ('handled'), or else by run()
+                    old = last_state[pid]
+                    changed = [f for f, v in e['state'].items()
+                               if old.get(f, changes) != v]
+                    if changed:
                         why = self._why(pid, e, k)
-                        for f in list(new) + [f for f in old if f not in new]:
-                            if old.get(f) != new.get(f):
-                                changes.append({
-                                    'step': k, 'pid': p.key, 'field': f,
-                                    'old': fmt(decode_value(old[f], T.pids))
-                                    if f in old else None,
-                                    'new': fmt(decode_value(new.get(f),
-                                                            T.pids)),
-                                    'why': why})
-                    last_state[pid] = new
+                        for f in changed:
+                            changes.append({
+                                'step': k, 'pid': p.key, 'field': f,
+                                'old': fmt(decode_value(old[f], T.pids))
+                                if f in old else None,
+                                'new': fmt(decode_value(e['state'][f],
+                                                        T.pids)),
+                                'why': why})
+                    last_state[pid] = dict(old, **e['state'])
             self._step_lines.append(lines)
         self.events, self.changes, self.logs = events, changes, logs
+
+    def _setup_state(self, pid):
+        """A process' fields after its setup() (before its first step)."""
+        state = {}
+        p = self.trace.procs.get(pid)
+        for e in (p.pre if p else ()):
+            state.update(e.get('state') or {})
+        return state
 
     @staticmethod
     def _log(step, pid, text, kind):
@@ -954,19 +964,18 @@ class ReplaySession:
             if s is None:
                 continue
             if s['status'] in ('created', 'setup', 'ready'):
-                for e in T.procs[st['pid']].pre:
-                    if e.get('state') is not None and not s['state']:
-                        s['state'] = e['state']
+                s['state'] = self._setup_state(st['pid'])
             s['status'] = 'running'
             s['waiting'] = None
             for e in st['events']:
                 kind = e['kind']
                 s['clock'] = e.get('clk', s['clock'])
-                if e.get('state') is not None:
-                    s['state'] = e['state']
+                if e.get('state'):
+                    s['state'] = dict(s['state'], **e['state'])
                 if e.get('frames'):
-                    # where it is (with locals at awaits)
-                    s['frames'] = e['frames']
+                    s['frames'] = e['frames']     # where it is
+                if e.get('locals') is not None:
+                    s['main_locals'] = e['locals']   # main()'s variables
                 if kind == 'new':
                     for c in e.get('children', []):
                         ensure(c)
@@ -975,10 +984,7 @@ class ReplaySession:
                         cs = ensure(c)
                         if cs is None:
                             continue
-                        for ce in T.procs[c].pre:
-                            if ce['kind'] == 'setup' and \
-                                    ce.get('state') is not None:
-                                cs['state'] = ce['state']
+                        cs['state'] = self._setup_state(c)
                         if cs['status'] == 'created':
                             cs['status'] = 'setup'
                 elif kind == 'startcall':
@@ -1003,15 +1009,10 @@ class ReplaySession:
                         w = self.src.await_loc(fr['file'], fr['line'])
                         w['timeout'] = e.get('timeout')
                         s['waiting'] = w
-                elif kind in ('handler', 'output', 'handled', 'timeout'):
-                    if kind == 'timeout':
-                        s['status'] = 'running'
                 elif kind == 'end':
                     s['status'] = e.get('status') or 'done'
                     s['error'] = e.get('error')
                     s['frames'] = []
-                    if e.get('locals'):
-                        s['main_locals'] = e['locals']
         for s in out.values():
             s['values'] = {k: decode_value(v, T.pids)
                            for k, v in s['state'].items()}
@@ -1052,8 +1053,6 @@ class ReplaySession:
                 d = self.src.loc(fr['file'], fr['line'])
                 d['func'] = MAIN if (s['main'] and fr['func'] == 'run') else (
                     'receive' if _HANDLER_RE.match(fr['func']) else fr['func'])
-                d['locals'] = {k: fmt(decode_value(v, T.pids))
-                               for k, v in (fr.get('locals') or {}).items()}
                 frames.append(d)
             if frames and s['waiting']:
                 # A blocked process is at its await: the compiler gives the
@@ -1277,14 +1276,8 @@ class ReplaySession:
         for s in states.values():
             if not s['main']:
                 continue
-            # main()'s variables: as it returned, or at its latest await
-            local_vars = s.get('main_locals')
-            if not local_vars:
-                local_vars = next((fr.get('locals') for fr in
-                                   reversed(s['frames'])
-                                   if fr.get('locals') is not None and
-                                   fr['func'] == 'run'), None) or {}
-            for k, v in local_vars.items():
+            # main()'s variables, as of its latest recorded event
+            for k, v in (s.get('main_locals') or {}).items():
                 scope[k] = viewify(decode_value(v, T.pids))
         allv = list(views.values())
         scope.update({'procs': allv,

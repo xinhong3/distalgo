@@ -822,15 +822,11 @@ function renderCards(procs, pos, compact) {
     else if (p.status === 'setup' || p.status === 'created') at = 'created, not started';
     const rows = Object.entries(p.state).map(([k, v]) =>
       `<tr class="field${changedNow.has(k) ? ' changed' : ''}" data-field="${esc(k)}" title="Why does ${esc(k)} have this value?"><td class="k">${esc(k)}</td><td class="v">${esc(v)}</td></tr>`).join('');
-    const inner = p.frames.length ? p.frames[p.frames.length - 1] : null;
-    const locs = inner ? Object.entries(inner.locals) : [];
-    const localRows = locs.map(([k, v]) => `<tr><td class="k">${esc(k)}</td><td class="v">${esc(v)}</td></tr>`).join('');
     card.innerHTML = `
       <div class="head"><span class="name" style="color:${classColor(p.cls)}" title="${esc(p.realId || p.id)}">${esc(p.id)}</span>
         <span class="badge ${p.status}">${p.status}</span><span class="clk" title="Lamport clock">clock ${p.clock == null ? '–' : p.clock}</span></div>
       ${at ? `<span class="at" title="${esc(at)}">${esc(at)}</span>` : ''}
       ${rows ? `<table>${rows}</table>` : '<div class="sub">no fields</div>'}
-      ${localRows ? `<div class="sub">locals in ${esc(inner.func)}()</div><table>${localRows}</table>` : ''}
       ${p.queue.length ? `<div class="sub">arrived, not yet handled</div><div class="inbox">${p.queue.map(esc).join('<br>')}</div>` : ''}
       ${timerLines(snap, p.id)}
       <div class="sub">sent ${p.sent}, received ${p.received}</div>`;

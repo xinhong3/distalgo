@@ -795,6 +795,8 @@ class WaitableQueue:
     def __len__(self):
         return self._q.__len__()
 
+_encoded_pids = {}             # ProcessId -> its encoding (computed once)
+
 def encode_value(value, depth=0, maxdepth=8, maxitems=500):
     """Encodes `value` as JSON-compatible data, keeping the Python types that
     DistAlgo programs use (tuples, sets, dicts with any keys, process ids), so
@@ -814,8 +816,12 @@ def encode_value(value, depth=0, maxdepth=8, maxitems=500):
                                                          float('-inf')) \
             else {"$repr": repr(value)}
     if isinstance(value, ProcessId):
-        return {"$pid": value._filename_form_(), "cls": value.pcls.__name__,
-                "short": value._short_form_()}
+        enc = _encoded_pids.get(value)
+        if enc is None:
+            enc = _encoded_pids[value] = {
+                "$pid": value._filename_form_(),
+                "cls": value.pcls.__name__, "short": value._short_form_()}
+        return enc
     if depth >= maxdepth:
         return {"$repr": _short_repr(value)}
 

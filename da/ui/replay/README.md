@@ -48,16 +48,22 @@ replayed); they are merged into the data file at the end, as viz merges the
 | `setup` | its `setup()` ran (in the new process) | arguments, state |
 | `new`, `setupcall`, `startcall` | it called `new`, `setup`, `start` | the processes, where in the program |
 | `send` | `send(...)` | destinations, payload, Lamport clock, where, cause |
-| `recv` | a message was taken off its queue (at a label) | sender, sender's clock, payload |
-| `handler`, `handled` | a `receive` handler ran | handler, bindings, the message, state after |
-| `await` | it blocked at an `await` | where (with local variables), state |
+| `recv` | a message was taken off its queue (at a label) | sender, sender's clock |
+| `handler` | a `receive` handler is about to run | handler, where, state |
+| `handled` | it has run | handler, bindings, the message, state |
+| `await` | it blocked at an `await` | where, state |
 | `timeout` | an `await`'s timeout expired | label |
 | `output` | `output(...)` | text, where |
-| `end` | `run()` returned, exited or crashed | status, error, state (`main()`'s variables) |
+| `end` | `run()` returned, exited or crashed | status, error, state |
 
 "Where" is the program's own stack (file, line, function), "cause" is the
 handler and message being handled, or what resumed `run()` (a message or a
-timeout).  Values are encoded keeping tuples, sets, dicts and process ids
+timeout).  "State" is the process' fields (`self._state`) that changed since
+its last recorded state, recorded after each handler, when the process
+blocks, and when it ends (so a change is put down to the handler, or else to
+`run()`); the payload of a message is recorded once,
+at its send.  `main()`'s events also carry its local variables, which
+conditions can refer to.  Values are encoded keeping tuples, sets, dicts and process ids
 (`da.common.encode_value`), so conditions can be evaluated on them.
 
 ## How a run becomes steps
