@@ -12,6 +12,7 @@ const MSG_COLORS = ['#2459d6', '#c0416b', '#1b8a7e', '#b7770a', '#6a4bb3',
 const REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const NODE_R = 28;
 const CARD_W = 236;
+const DIM = '#aab3b9';     // messages of processes not picked in the network
 
 const S = {
   blocks: [],          // {name, code, kind: 'process' | 'main' | 'code'}
@@ -28,6 +29,10 @@ const S = {
   msgColors: {},
   sweep: false,
   lastLogCount: 0,
+  filter: new Set(),   // processes picked in the network: show only their messages
+  zoom: {},            // view -> its d3 pan/zoom transform
+  zoomTouched: {},     // view -> moved by the user (else it is fitted)
+  size: {},            // view -> {W, H} as drawn
 };
 
 // ---------------------------------------------------------------- utilities
@@ -351,7 +356,8 @@ async function load() {
   S.sel = null;
   S.msgColors = {};
   S.lastLogCount = 0;
-  S.centerNet = true;
+  S.filter = new Set();
+  S.zoomTouched = {};
   setSnap(res, { status: `Replaying ${prog}: ${res.info.steps} recorded steps. Step forward, play, or set a breakpoint or condition and run to it.` });
 }
 function gotoDelivery(key) {
@@ -602,12 +608,13 @@ function renderStage(opts) {
   const has = !!S.snap;
   $('stage-empty').style.display = has ? 'none' : '';
   $('net').style.display = has && S.view === 'network' ? '' : 'none';
-  $('timeline').hidden = !(has && S.view === 'timeline');
+  $('timeline').hidden = $('tlhead').hidden = !(has && S.view === 'timeline');
   if (has) {
     if (S.view === 'network') renderNet(opts);
     else renderTimeline();
   }
   renderLegend();
+  renderFilterBar();
 }
 function renderLegend() {
   const el = $('legend');
@@ -690,8 +697,9 @@ function renderNet(opts) {
   recent.forEach((e) => {
     if (!pos[e.src] || !pos[e.dst]) return;
     const c = curve(pos[e.src], pos[e.dst], 26);
-    ghosts.append('path').attr('class', 'ghost').attr('d', c.d)
-      .attr('stroke', msgColor(e.payload)).attr('marker-end', markerFor(msgColor(e.payload)));
+    const color = netColor(e);
+    ghosts.append('path').attr('class', 'ghost' + (picked(e.src) ? '' : ' dim')).attr('d', c.d)
+      .attr('stroke', color).attr('marker-end', markerFor(color));
   });
 
   // in-flight messages, grouped by channel
@@ -708,9 +716,9 @@ function renderNet(opts) {
     const first = ms[0];
     if (!pos[first.src] || !pos[first.dst]) return;
     const c = curve(pos[first.src], pos[first.dst], 26);
-    const color = msgColor(first.payload);
+    const color = netColor(first);
     const isNext = ms.some((m) => m.key === nextKey);
-    const g = mg.append('g').attr('class', 'msg' + (isNext ? ' next' : ''));
+    const g = mg.append('g').attr('class', 'msg' + (isNext ? ' next' : '') + (picked(first.src) ? '' : ' dim'));
     if (ms.some((m) => m.key === selKey)) g.append('path').attr('class', 'glow').attr('d', c.d);
     g.append('path').attr('class', 'line').attr('d', c.d).attr('stroke', color)
       .attr('stroke-dasharray', '6 4').attr('marker-end', markerFor(color));
@@ -752,9 +760,12 @@ function renderNet(opts) {
         .attr('stroke', sel ? '#2459d6' : ringColor)
         .attr('stroke-dasharray', p.status === 'blocked' || p.status === 'ready' ? '4 3' : null);
     }
+    if (S.filter.has(p.id)) g.append('circle').attr('class', 'pick').attr('r', NODE_R + 10);
     g.append('circle').attr('class', 'body').attr('r', NODE_R).attr('fill', classColor(p.cls))
-      .on('click', () => selectProc(p.id))
-      .on('mousemove', () => showTip(d3.event, `${p.id}: ${p.status}\nClick to see the code it is running.`))
+      .on('click', () => toggleFilter(p.id))
+      .on('mousemove', () => showTip(d3.event, `${p.id}: ${p.status}\n` + (S.filter.has(p.id)
+        ? 'Click to stop showing only its messages.'
+        : 'Click to see the code it is running and show only the messages it sends (click again to undo).')))
       .on('mouseleave', hideTip);
     const myTimers = (snap.timers || []).filter((x) => x.owner === p.id);
     if (myTimers.length) {
@@ -781,7 +792,7 @@ function renderNet(opts) {
       const path = ghosts.append('path').attr('d', c.d).attr('fill', 'none').attr('stroke', 'none');
       const node = path.node();
       const L = node.getTotalLength();
-      const dot = ghosts.append('circle').attr('r', 5).attr('fill', msgColor(e.payload));
+      const dot = ghosts.append('circle').attr('r', 5).attr('fill', netColor(e));
       dot.transition().duration(480).ease(d3.easeCubicInOut)
         .attrTween('transform', () => (t) => {
           const pt = node.getPointAtLength(t * L);
@@ -792,12 +803,8 @@ function renderNet(opts) {
   }
 
   renderCards(procs, pos, size.compact);
-  if (S.centerNet) {
-    // after a (re)start, scroll a large network so its middle is in view
-    S.centerNet = false;
-    stage.scrollLeft = Math.max(0, (W - stage.clientWidth) / 2);
-    stage.scrollTop = Math.max(0, (H - stage.clientHeight) / 2);
-  }
+  S.size.network = { W, H };
+  syncZoom('network');
 }
 
 function renderCards(procs, pos, compact) {
@@ -875,8 +882,11 @@ function renderTimeline() {
     svg.append('text').attr('class', 'tl-step').attr('x', 12).attr('y', y(s) + 4).text('step ' + s);
   }
   svg.append('line').attr('class', 'tl-now').attr('x1', left).attr('x2', W - 10).attr('y1', y(snap.step)).attr('y2', y(snap.step));
+  // the process names: a row that stays at the top (see the zoom handler)
+  const head = d3.select('#tlheadsvg');
+  head.selectAll('*').remove();
   procs.forEach((p) => {
-    svg.append('text').attr('class', 'tl-head').attr('x', x[p.id]).attr('y', 24).attr('text-anchor', 'middle')
+    head.append('text').attr('class', 'tl-head').datum(x[p.id]).attr('y', 20).attr('text-anchor', 'middle')
       .attr('fill', classColor(p.cls)).text(p.id).style('cursor', 'pointer').on('click', () => selectProc(p.id));
     svg.append('line').attr('class', 'tl-col').attr('x1', x[p.id]).attr('x2', x[p.id])
       .attr('y1', top - 8).attr('y2', y(snap.step) + rowH).attr('stroke', classColor(p.cls)).attr('opacity', 0.5);
@@ -908,8 +918,98 @@ function renderTimeline() {
       .on('mousemove', () => showTip(d3.event, `${e.pid}: ${e.interval}s timer fired at step ${e.step}`))
       .on('mouseleave', hideTip);
   });
-  const tl = $('stage');
-  if (S.view === 'timeline') tl.scrollTop = tl.scrollHeight;
+  S.size.timeline = { W, H };
+  syncZoom('timeline');
+}
+
+// ---------------------------------------------------------------- picking
+// Clicking processes in the network shows only the messages they send; the
+// others are greyed out until they are clicked again or "Show all".
+function picked(pid) { return !S.filter.size || S.filter.has(pid); }
+function netColor(m) { return picked(m.src) ? msgColor(m.payload) : DIM; }
+function toggleFilter(id) {
+  if (S.filter.has(id)) { S.filter.delete(id); renderAll(); return; }
+  S.filter.add(id);
+  selectProc(id);
+}
+function renderFilterBar() {
+  $('filter-bar').hidden = !(S.filter.size && S.view === 'network');
+  $('filter-names').textContent = [...S.filter].join(', ');
+}
+
+// ---------------------------------------------------------------- pan & zoom
+// Each view is drawn at its full size and shown under its own transform:
+// drag to move it, the wheel scrolls, Ctrl/⌘ + wheel (or a pinch) and the
+// buttons zoom.  Until it is moved, a view is fitted: the whole network, or
+// the timeline's width and its latest steps (so it follows the replay).
+const zoomer = d3.zoom()
+  .scaleExtent([0.1, 4])
+  .filter(() => {
+    const e = d3.event;
+    if (e.target.closest && e.target.closest('.stage-tools')) return false;
+    if (e.type === 'wheel') return e.ctrlKey || e.metaKey;
+    return !e.button && e.type !== 'dblclick';
+  })
+  .wheelDelta(() => {
+    const e = d3.event;
+    const d = -e.deltaY * (e.deltaMode === 1 ? 0.05 : e.deltaMode ? 1 : 0.002) * (e.ctrlKey ? 10 : 1);
+    return Math.max(-0.5, Math.min(0.5, d));      // pinch, but not 4x per notch
+  })
+  .on('zoom', () => {
+    S.zoom[S.view] = d3.event.transform;
+    if (d3.event.sourceEvent) S.zoomTouched[S.view] = true;
+    const el = S.view === 'network' ? $('net') : $('timeline');
+    const t = d3.event.transform;
+    el.style.transform = `translate(${t.x}px,${t.y}px) scale(${t.k})`;
+    if (S.view === 'timeline') {      // its header row: moves only sideways
+      d3.selectAll('#tlheadsvg text').attr('x', (x0) => t.x + x0 * t.k);
+    }
+  });
+function fitTransform(view) {
+  const st = $('stage'), sz = S.size[view];
+  const sw = st.clientWidth, sh = st.clientHeight;
+  if (view === 'network') {
+    const k = Math.max(0.1, Math.min(1, (sw - 16) / sz.W, (sh - 16) / sz.H));
+    return d3.zoomIdentity.translate((sw - sz.W * k) / 2, (sh - sz.H * k) / 2).scale(k);
+  }
+  const k = Math.max(0.1, Math.min(1, sw / sz.W));
+  return d3.zoomIdentity.translate(0, Math.min(0, sh - sz.H * k)).scale(k);
+}
+function syncZoom(view) {
+  // d3 keeps one transform on the stage: make it this view's, and keep the
+  // drawing (with a margin) in view when it is moved
+  const sz = S.size[view], pad = 120;
+  zoomer.translateExtent([[-pad, -pad], [sz.W + pad, sz.H + pad]]);
+  const t = S.zoomTouched[view] && S.zoom[view] ? S.zoom[view] : fitTransform(view);
+  d3.select($('stage')).call(zoomer.transform, t);
+}
+function zoomBy(f) {
+  if (!S.snap) return;
+  S.zoomTouched[S.view] = true;
+  d3.select($('stage')).transition().duration(180).call(zoomer.scaleBy, f);
+}
+function zoomFit() {
+  if (!S.snap) return;
+  S.zoomTouched[S.view] = false;
+  d3.select($('stage')).transition().duration(250).call(zoomer.transform, fitTransform(S.view));
+}
+function wireZoom() {
+  const stage = $('stage');
+  d3.select(stage).call(zoomer);
+  stage.addEventListener('wheel', (e) => {
+    if (e.ctrlKey || e.metaKey || !S.snap) return;           // zoom: d3's
+    const card = e.target.closest('.card');
+    if (card && card.scrollHeight > card.clientHeight) return; // the card scrolls
+    e.preventDefault();
+    S.zoomTouched[S.view] = true;
+    const k = (S.zoom[S.view] || d3.zoomIdentity).k;
+    const dx = e.shiftKey && !e.deltaX ? e.deltaY : e.deltaX, dy = e.shiftKey && !e.deltaX ? 0 : e.deltaY;
+    d3.select(stage).call(zoomer.translateBy, -dx / k, -dy / k);
+  }, { passive: false });
+  $('zoom-in').onclick = () => zoomBy(1.25);
+  $('zoom-out').onclick = () => zoomBy(0.8);
+  $('zoom-fit').onclick = zoomFit;
+  $('filter-reset').onclick = () => { S.filter.clear(); renderAll(); };
 }
 
 // ---------------------------------------------------------------- log
@@ -1140,6 +1240,7 @@ function wire() {
     else if (e.key === 'Escape') { S.sel = null; renderAll(); }
   });
   window.addEventListener('resize', () => renderStage({}));
+  wireZoom();
 }
 
 wire();

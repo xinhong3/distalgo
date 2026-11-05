@@ -284,13 +284,24 @@ button.small { padding: 2px 9px; font-size: 12.5px; }
   position: relative;
   flex: 1;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;            /* panned and zoomed instead (app.js) */
+  cursor: grab;
+  touch-action: none;
   background-color: var(--canvas);
   background-image: radial-gradient(var(--grid) 1px, transparent 1px);
   background-size: 18px 18px;
 }
 .stage-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); }
-.net { position: relative; }
+.stage:active { cursor: grabbing; }
+.tlhead { position: absolute; left: 0; right: 0; top: 0; height: 30px; overflow: hidden;
+          background: var(--canvas); border-bottom: 1px solid var(--line); }
+.tlhead svg { display: block; width: 100%; height: 30px; }
+.net, .timeline { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+.stage-tools { position: absolute; right: 10px; bottom: 10px; display: flex; gap: 4px; cursor: default; }
+.stage-tools button { min-width: 30px; padding: 2px 8px; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+.filter-bar { margin-left: 14px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.filter-bar b { color: var(--ink); font-weight: 600; }
+.filter-bar button { margin-left: 6px; padding: 1px 8px; font-size: 12px; }
 #netsvg { display: block; }
 .cards { position: absolute; inset: 0; pointer-events: none; }
 .card {
@@ -340,6 +351,7 @@ button.small { padding: 2px 9px; font-size: 12.5px; }
 .node circle.body { stroke: #fff; stroke-width: 2; cursor: pointer; }
 .node text { fill: #fff; font: 600 11px var(--sans); pointer-events: none; }
 .node .ring { fill: none; stroke-width: 2; }
+.node .pick { fill: none; stroke: var(--ink); stroke-width: 2.5; }
 .node.done circle.body { opacity: 0.45; }
 .node.sel .ring { stroke: var(--blue); stroke-width: 3; }
 .mesh { stroke: #c5cec9; stroke-dasharray: 2 5; }
@@ -351,6 +363,8 @@ button.small { padding: 2px 9px; font-size: 12.5px; }
 .msg.next path.line { stroke-width: 3; }
 .msg.next text { font-weight: 600; }
 .ghost { fill: none; stroke-width: 2; opacity: 0.35; }
+.msg.dim { opacity: 0.4; }
+.ghost.dim { opacity: 0.2; }
 
 /* timeline */
 .timeline { padding: 0; }

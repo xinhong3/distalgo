@@ -76,6 +76,8 @@
     <div class="viewtabs">
       <button data-view="network" class="on">Network</button>
       <button data-view="timeline">Timeline</button>
+      <span class="filter-bar" id="filter-bar" hidden>Messages from <b id="filter-names"></b>
+        <button id="filter-reset" title="Show the messages of all processes">Show all</button></span>
       <span class="legend" id="legend"></span>
     </div>
     <div class="stage" id="stage">
@@ -84,7 +86,13 @@
         <div class="cards" id="cards"></div>
       </div>
       <div class="timeline" id="timeline" hidden><svg id="tlsvg"></svg></div>
+      <div class="tlhead" id="tlhead" hidden><svg id="tlheadsvg"></svg></div>
       <div class="stage-empty" id="stage-empty"><p>Loading the recorded run…</p></div>
+      <div class="stage-tools" title="Drag to move; the wheel scrolls; Ctrl/⌘ + wheel or pinch zooms">
+        <button id="zoom-out" aria-label="Zoom out">−</button>
+        <button id="zoom-in" aria-label="Zoom in">+</button>
+        <button id="zoom-fit" title="Show all of it (the timeline: its latest steps)">Fit</button>
+      </div>
     </div>
   </section>
 
