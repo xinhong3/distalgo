@@ -41,7 +41,7 @@ import da
 from . import common, pattern
 from .common import (builtin, internal, name_split_host, name_split_node,
                      ProcessId, get_runtime_option,
-                     ObjectDumper, ObjectLoader)
+                     ObjectDumper, ObjectLoader, TraceKind)
 from .transport import ChannelCaps, TransportManager, HEADER_SIZE, \
     TransportException, AuthenticationException
 
@@ -64,19 +64,18 @@ _GENERATED_RE = re.compile(r'^(ExistentialOpExpr|UniversalOpExpr|QueryExpr|'
 
 _program_files = {}         # code object -> its file, if it is the program's
 
-def _program_file(code):
-    """The (absolute) file of `code` if it is the DistAlgo program's own code,
-    else None: not DistAlgo's runtime, the standard library, or helpers the
-    compiler generates for queries.  Compiled DistAlgo code keeps its .da
-    file name, so a .da file is always the program's, wherever it is (also
-    under da/, e.g. da/examples).  Cached per code object."""
-    try:
-        return _program_files[code]
-    except KeyError:
-        pass
-    fn = code.co_filename
-    if fn.startswith('<') or code.co_name.startswith('<') or \
-       _GENERATED_RE.match(code.co_name):
+def _program_file(code):    ### CHECK: name should be something like `_user_code_file`.
+    """ Return the absolute path of the file `code` was compiled from.
+    `code` should belong to the user's program, therefore the following are skipped:
+    - DistAlgo's runtime (e.g. sim.py), the standard library
+    - generated code for queries
+    - has no source file (e.g. `exec`), or is anonymous (e.g. lambda, comprehension, or module body).
+    """
+    if code in _program_files:    # return directly if cached
+        return _program_files[code] 
+    fn = code.co_filename         # string type
+    if (fn.startswith('<') or code.co_name.startswith('<')  # skips
+        or _GENERATED_RE.match(code.co_name)):
         res = None
     else:
         res = os.path.abspath(fn)
@@ -86,29 +85,30 @@ def _program_file(code):
     _program_files[code] = res
     return res
 
-def _program_frames(frame, locals_of=None):
-    """The program's frames from `frame` outward (innermost first), as
-    [{'file', 'line', 'func'}]; the frame running the code `locals_of` (the
-    compiled main()) also gets its variables, as 'locals'."""
-    out = []
+def _program_frames(frame):
+    """Yields (frame, file) for each frame running user code (see `_program_file`)
+    among `frame` and its callers, most recent call first, stopping before the
+    frame of `_delayed_start`.
+    """
     while frame is not None:
         code = frame.f_code
         if code.co_name == '_delayed_start' and code.co_filename == __file__:
             # the start of this process: frames further out belong to
             # whoever created it (a forked child still has its parent's)
             break
-        fn = _program_file(code)
-        if fn is not None:
-            d = {'file': fn, 'line': frame.f_lineno, 'func': code.co_name}
-            if code is locals_of:
-                d['locals'] = {
-                    k: common.encode_value(v, maxdepth=4)
-                    for k, v in frame.f_locals.items()
-                    if not k.startswith('_') and k != 'self' and
-                    not callable(v) and not isinstance(v, type(sys))}
-            out.append(d)
+        fn = _program_file(code)    # get the path of source file
+        if fn:                      # if it's written by user
+            yield frame, fn
         frame = frame.f_back
-    return out
+
+def _encode_locals(frame):
+    """Returns the local variables of `frame`, encoded, without `self`, names
+    starting with '_', callables, and modules.
+    """
+    return {k: common.encode_value(v, maxdepth=4)
+            for k, v in frame.f_locals.items()
+            if not k.startswith('_') and k != 'self' and
+            not callable(v) and not isinstance(v, type(sys))}
 
 def _source_file(cls):
     """The source file (.da) a process class was compiled from."""
@@ -222,6 +222,9 @@ class DistProcess():
         self.__rec = rec if getattr(rec, 'records_events', False) else None
         self.__recseq = itertools.count()
         self.__recfields = {}      # field -> encoded value last recorded
+        # main()'s code, whose variables are recorded (main() has no _state)
+        self.__main_code = type(self).run.__code__ \
+            if isinstance(self, NodeProcess) else None
         # What the process is doing, to explain its sends and changes: the
         # handler running (`__cause`), else what resumed run().
         self.__step_cause = {'type': 'start'}
@@ -242,12 +245,12 @@ class DistProcess():
         if self.__rec is None:
             return
         if where:
-            main = type(self).run.__code__ \
-                if isinstance(self, NodeProcess) else None
-            frames = _program_frames(sys._getframe(1), locals_of=main)
-            for fr in frames:
-                if 'locals' in fr:
-                    data['locals'] = fr.pop('locals')
+            frames = []
+            for frame, filename in _program_frames(sys._getframe(1)):
+                frames.append({'file': filename, 'line': frame.f_lineno,
+                               'func': frame.f_code.co_name})
+                if frame.f_code is self.__main_code:
+                    data['locals'] = _encode_locals(frame)
             data['frames'] = frames
         if why:
             data['cause'] = self.__cause or {'type': 'run',
@@ -313,7 +316,7 @@ class DistProcess():
                         to=self.__parent, flags=ChannelCaps.RELIABLEFIFO)
         self._wait_for(lambda: self.__running)
         status, error = 'done', None
-        self._record('run', state=True, cls=type(self).__name__,
+        self._record(TraceKind.Run, state=True, cls=type(self).__name__,
                      parent=_pid_str(self.__parent),
                      file=_source_file(type(self)))
         try:
@@ -327,7 +330,7 @@ class DistProcess():
                             e, exc_info=1)
             return -1
         finally:
-            self._record('end', state=True, status=status, error=error)
+            self._record(TraceKind.End, state=True, status=status, error=error)
 
     @internal
     def _init_config(self):
@@ -469,7 +472,7 @@ class DistProcess():
                                              daemon=daemon)
         self._log.debug("%d instances of %s created: %r",
                         len(children), pcls, children)
-        self._record('new', where=True, why=True, cls=pcls.__name__,
+        self._record(TraceKind.New, where=True, why=True, cls=pcls.__name__,
                      file=_source_file(pcls),
                      children=[_pid_str(c) for c in children])
         self._sync_async_event(Command.NewAck, seqno, children)
@@ -497,7 +500,7 @@ class DistProcess():
                             "instead.".format(args))
         res = True
         if self._recording:
-            self._record('setupcall', where=True, why=True,
+            self._record(TraceKind.SetupCall, where=True, why=True,
                          procs=[_pid_str(p) for p in _targets(procs)],
                          args=common.encode_value(list(args)))
         if seqno is None:
@@ -524,7 +527,7 @@ class DistProcess():
         if args is not None:
             if not self._setup(procs, args, seqno=seqno):
                 return False
-        self._record('startcall', where=True, why=True,
+        self._record(TraceKind.StartCall, where=True, why=True,
                      procs=[_pid_str(p) for p in _targets(procs)])
         self._register_async_event(msgtype=Command.StartAck, seqno=seqno)
         if self._send1(msgtype=Command.Start, message=seqno, to=procs,
@@ -596,7 +599,7 @@ class DistProcess():
         if level > self._log.getEffectiveLevel():
             msg = sep.join([str(v) for v in message])
             self._log.log(level, msg)
-            self._record('output', where=True, text=msg)
+            self._record(TraceKind.Output, where=True, text=msg)
 
     @builtin
     def debug(self, *message, sep=' '):
@@ -679,7 +682,7 @@ class DistProcess():
                           flags=flags,
                           impersonate=impersonate)
         if self._recording:
-            self._record('send', where=True, why=True,
+            self._record(TraceKind.Send, where=True, why=True,
                          sclk=self._logical_clock,
                          to=[_pid_str(d) for d in _targets(to)],
                          payload=common.encode_value(message))
@@ -809,14 +812,14 @@ class DistProcess():
             self.exit(10)
 
         if block:
-            self._record('await', where=True, why=True, state=True,
+            self._record(TraceKind.Await, where=True, why=True, state=True,
                          label=name, timeout=timeout)
         self.__do_label(name, block, timeout)
         self.__process_jobqueue(name)
 
     def __rec_timeout(self, label):
         if self._recording:
-            self._record('timeout', label=label)
+            self._record(TraceKind.Timeout, label=label)
             # run() continues because of the timeout (until the next event)
             self.__step_cause = {'type': 'timeout', 'label': label}
 
@@ -884,7 +887,7 @@ class DistProcess():
                 saved = self.__cause
                 if self._recording:
                     # where run() is, and what it changed, before the handler
-                    self._record('handler', where=True, why=True, state=True,
+                    self._record(TraceKind.Handler, where=True, why=True, state=True,
                                  handler=handler.__name__)
                     code = getattr(handler, '__code__', None)
                     self.__cause = {
@@ -905,7 +908,7 @@ class DistProcess():
                         e, handler.__name__, args, e)
                 finally:
                     # what the handler changed
-                    self._record('handled', why=True, state=True)
+                    self._record(TraceKind.Handled, why=True, state=True)
                     self.__cause = saved
             else:
                 if self._keep_unmatched:
@@ -1073,7 +1076,7 @@ class DistProcess():
                 self.__setup_called = True
                 self._log.debug("`setup` complete.")
                 if self._recording:
-                    self._record('setup', state=True, parent=_pid_str(src),
+                    self._record(TraceKind.Setup, state=True, parent=_pid_str(src),
                                  cls=type(self).__name__,
                                  file=_source_file(type(self)),
                                  args=common.encode_value(list(realargs)))
@@ -1130,7 +1133,7 @@ class DistProcess():
             # (sender, sender's clock) names the message: the replay pairs it
             # with the send, which recorded the payload
             msg = {'src': _pid_str(peer_id), 'sclk': peer_clk}
-            self._record('recv', **msg)
+            self._record(TraceKind.Recv, **msg)
             # run() continues because of this message (until the next one):
             self.__step_cause = dict(msg, type='message')
         self.__trigger_event(
@@ -1236,7 +1239,7 @@ class NodeProcess(DistProcess):
             self.bootstrap()
         status, error = 'done', None
         # main()'s variables are recorded with its events (see _record)
-        self._record('run', state=True, cls=type(self).__name__, parent=None,
+        self._record(TraceKind.Run, state=True, cls=type(self).__name__, parent=None,
                      file=_source_file(type(self)), main=True)
         try:
             if (not get_runtime_option('idle')) and hasattr(self, 'run'):
@@ -1252,7 +1255,7 @@ class NodeProcess(DistProcess):
                             e, exc_info=1)
             return -1
         finally:
-            self._record('end', state=True, status=status, error=error)
+            self._record(TraceKind.End, state=True, status=status, error=error)
             self._send1(Command.NodeLeave,
                         message=self._id, to=self._nodes)
 

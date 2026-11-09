@@ -25,6 +25,7 @@
 import os
 import sys
 import copy
+import enum
 import time
 import json
 import pickle
@@ -873,6 +874,31 @@ def _short_repr(value, limit=200):
     return s if len(s) <= limit else s[:limit - 1] + '…'
 
 
+class TraceKind(str, enum.Enum):
+    """Kinds of events recorded by `DistProcess._record`.
+
+    Each event has 'kind', 'pid', 'seq', 't' (wall time) and 'clk' (logical
+    clock). Depending on the kind, it also has:
+        - 'frames': where in the program it happened
+        - 'cause': the handler running, or what resumed run()
+        - 'state': the `_state` fields changed since they were last recorded
+
+    """                     # when | what
+    Run       = 'run'       # before run() starts, after `start` | class, parent, file; state
+    End       = 'end'       # after run() returns, exits or crashes | status, error; state
+    Setup     = 'setup'     # in the new process, after setup() returns | parent, class, file, args; state
+    SetupCall = 'setupcall' # in the caller, when setup() is called | procs, args; frames, cause
+    StartCall = 'startcall' # in the caller, when start() is called | procs; frames, cause
+    New       = 'new'       # in the caller, after new() creates the processes | class, file, children; frames, cause
+    Output    = 'output'    # after output() prints | text; frames
+    Send      = 'send'      # after send() hands the message to the router | to, sclk, payload; frames, cause
+    Recv      = 'recv'      # when a message from a process is taken off the queue, before its handlers | src, sclk
+    Await     = 'await'     # before run() blocks at an await, each time it waits | label, timeout; frames, cause, state
+    Timeout   = 'timeout'   # when an await's timeout expires | label
+    Handler   = 'handler'   # before a receive handler runs | handler; frames, cause, state (what run() changed)
+    Handled   = 'handled'   # after the handler returns or raises | cause, state (what the handler changed)
+    Error     = 'error'     # in place of an event that cannot be serialized | text
+
 class StateQueue:
     """A queue that stores the state in order.
 
@@ -900,7 +926,7 @@ class StateQueue:
         try:
             line = json.dumps(record, default=_short_repr)
         except Exception as e:
-            line = json.dumps({'kind': 'error', 'pid': record.get('pid'),
+            line = json.dumps({'kind': TraceKind.Error, 'pid': record.get('pid'),
                                'text': 'unrecordable event: %r' % e})
         with self._events_lock:
             if self._events_file is not None:
