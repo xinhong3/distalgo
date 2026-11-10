@@ -29,8 +29,11 @@ follows the recorded wall-clock times.
 import argparse
 import ast
 import collections
+import contextlib
 import glob
 import heapq
+import io
+import itertools
 import json
 import os
 import re
@@ -42,9 +45,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import da
 from da.compiler import ui as daui
-
-import contextlib
-import io
 from da.compiler import utils as dautils
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -55,10 +55,11 @@ MAIN = 'main'
 
 
 @contextlib.contextmanager
-def _quiet_compiler(buf):
+def _quiet_compiler(buf=None):
     """Sends the compiler's messages to `buf` (its printers bind sys.stderr
     as a default argument, so redirecting stderr is not enough; from
     DistAlgo Live)."""
+    buf = buf or io.StringIO()
     old = daui.stderr
     daui.stderr = buf
     printers = [f for f in vars(dautils).values()
@@ -74,6 +75,12 @@ def _quiet_compiler(buf):
         daui.stderr = old
         for f, d in zip(printers, saved):
             f.__defaults__ = d
+
+
+def _da_compile(conv, src, fn, buf=None):
+    """`conv` (daui.dastr_to_pyast or dastr_to_pycode) of `src`, quietly."""
+    with _quiet_compiler(buf):
+        return conv(src, fn, daui.parse_compiler_args([]))
 
 
 # --------------------------------------------------------------------------
@@ -128,8 +135,12 @@ class ReplayRepr(str):
 def decode_value(v, pids):
     """The inverse of `da.common.encode_value`; `pids` maps recorded process
     ids to `ReplayPid`s."""
+    def items(xs):
+        return [decode_value(x, pids) for x in xs
+                if not (isinstance(x, dict) and '$more' in x)]
+
     if isinstance(v, list):
-        return [decode_value(x, pids) for x in v if not _is_more(x)]
+        return items(v)
     if not isinstance(v, dict):
         return v
     if '$pid' in v:
@@ -140,24 +151,20 @@ def decode_value(v, pids):
             pids[v['$pid']] = p
         return p
     if '$tuple' in v:
-        return tuple(decode_value(x, pids) for x in v['$tuple']
-                     if not _is_more(x))
+        return tuple(items(v['$tuple']))
     if '$set' in v:
-        items = [decode_value(x, pids) for x in v['$set'] if not _is_more(x)]
+        xs = items(v['$set'])
         try:
-            return set(items)
+            return set(xs)
         except TypeError:
-            return items
+            return xs
     if '$dict' in v:
         out = {}
-        for kv in v['$dict']:
-            if _is_more(kv):
-                continue
-            k = decode_value(kv[0], pids)
+        for k, x in items(v['$dict']):
             try:
-                out[k] = decode_value(kv[1], pids)
+                out[k] = x
             except TypeError:
-                out[ReplayRepr(fmt(k))] = decode_value(kv[1], pids)
+                out[ReplayRepr(fmt(k))] = x
         return out
     if '$obj' in v:
         return ReplayObj(v['$obj'], {k: decode_value(x, pids)
@@ -165,10 +172,6 @@ def decode_value(v, pids):
     if '$repr' in v:
         return ReplayRepr(v['$repr'])
     return v
-
-
-def _is_more(x):
-    return isinstance(x, dict) and '$more' in x
 
 
 def _pretty(v, depth=0):
@@ -207,9 +210,8 @@ def fmt(v, limit=200):
 # The program's source: blocks for the UI, and the code around each line
 # --------------------------------------------------------------------------
 
-_HEADER_KINDS = ((ast.FunctionDef, 'def'), (ast.For, 'for'),
-                 (ast.While, 'while'), (ast.If, 'if'), (ast.With, 'with'),
-                 (ast.Try, 'try'))
+_HEADER_KINDS = {ast.FunctionDef: 'def', ast.For: 'for', ast.While: 'while',
+                 ast.If: 'if', ast.With: 'with', ast.Try: 'try'}
 _CLASS_RE = re.compile(r'^class\s+(\w+)')
 _HANDLER_RE = re.compile(r'^_\w+_handler_\d+$')
 
@@ -219,27 +221,16 @@ def _index_headers(module):
     (from DistAlgo Live)."""
     index = {}
 
-    def kind_of(s):
-        for t, k in _HEADER_KINDS:
-            if isinstance(s, t):
-                return k
-        return None
-
     def visit(stmts, chain):
         for s in stmts:
             index.setdefault(s.lineno, chain)
-            k = kind_of(s)
-            if isinstance(s, ast.ClassDef):
-                visit(s.body, chain)
-            elif k is not None:
-                inner = chain + ((s.lineno, k),)
-                visit(s.body, inner)
-                if getattr(s, 'orelse', None):
-                    visit(s.orelse, inner)
-                for h in getattr(s, 'handlers', []) or []:
-                    visit(h.body, inner)
-                if getattr(s, 'finalbody', None):
-                    visit(s.finalbody, inner)
+            k = _HEADER_KINDS.get(type(s))
+            if k or isinstance(s, ast.ClassDef):
+                inner = chain + ((s.lineno, k),) if k else chain
+                for b in [s.body, getattr(s, 'orelse', [])] + \
+                        [h.body for h in getattr(s, 'handlers', [])] + \
+                        [getattr(s, 'finalbody', [])]:
+                    visit(b, inner)
     visit(module.body, ())
     return index
 
@@ -249,31 +240,24 @@ def split_blocks(lines):
     first class ('setup'), one block per top-level class, and the rest
     ('main').  Unlike DistAlgo Live's split, no line is dropped, so a line
     of the file maps to a block by an offset."""
-    starts = [(i + 1, _CLASS_RE.match(l).group(1))
-              for i, l in enumerate(lines) if _CLASS_RE.match(l)]
+    matches = [(i + 1, m.group(1))
+               for i, m in enumerate(map(_CLASS_RE.match, lines)) if m]
     n = len(lines)
-    if not starts:
+    if not matches:
         return [(MAIN, 1, max(n, 1))]
+    firsts, names = map(list, zip(*matches))
+    # the last class ends at the next unindented statement
+    end = next((j for j in range(firsts[-1], n)
+                if lines[j][:1].strip() and lines[j][0] != '#'), n)
+    lasts = [f - 1 for f in firsts[1:]] + [end]
     blocks = []
-    if any(l.strip() for l in lines[:starts[0][0] - 1]):
-        blocks.append(('setup', 1, starts[0][0] - 1))
+    if any(l.strip() for l in lines[:firsts[0] - 1]):
+        blocks.append(('setup', 1, firsts[0] - 1))
     else:
-        starts[0] = (1, starts[0][1])
-    for k, (first, name) in enumerate(starts):
-        last = starts[k + 1][0] - 1 if k + 1 < len(starts) else n
-        if k + 1 == len(starts):
-            # the last class ends at the next unindented statement
-            for j in range(first, n):
-                l = lines[j]
-                if l.strip() and not l[0].isspace() and \
-                        not l.lstrip().startswith('#'):
-                    blocks.append((name, first, j))
-                    blocks.append((MAIN, j + 1, n))
-                    break
-            else:
-                blocks.append((name, first, last))
-        else:
-            blocks.append((name, first, last))
+        firsts[0] = 1
+    blocks += zip(names, firsts, lasts)
+    if end < n:
+        blocks.append((MAIN, end + 1, n))
     return blocks
 
 
@@ -318,9 +302,7 @@ class SourceMap:
         """Headers from the compiled program, where an await is the loop the
         compiler generates for it; from the plain source if that fails."""
         try:
-            args = daui.parse_compiler_args([])
-            with _quiet_compiler(io.StringIO()):
-                pyast = daui.dastr_to_pyast(src, fn, args)
+            pyast = _da_compile(daui.dastr_to_pyast, src, fn)
             if pyast is not None:
                 return _index_headers(pyast)
         except Exception:
@@ -467,13 +449,6 @@ def load(path):
     return data
 
 
-def data_file_name(program):
-    """`<program>.replay.json` in the current directory (where viz writes
-    `<program>.html`)."""
-    base = os.path.splitext(os.path.basename(program or 'run'))[0]
-    return base + '.replay.json'
-
-
 # --------------------------------------------------------------------------
 # The recorded run
 # --------------------------------------------------------------------------
@@ -482,24 +457,21 @@ class Proc:
     def __init__(self, id, events):
         self.id = id
         self.events = events
-        first = events[0] if events else {}
         self.cls = next((e['cls'] for e in events if e.get('cls') and
                          e['kind'] in ('run', 'setup')), id.split('-')[0])
         self.is_main = any(e['kind'] == 'run' and e.get('main') for e in events)
-        self.parent = next((e.get('parent') for e in events
-                            if e['kind'] in ('run', 'setup')), None)
         self.file = next((e.get('file') for e in events if e.get('file') and
                           e['kind'] in ('run', 'setup')), None)
         self.key = None
         self.pid = None           # ReplayPid
         self.segments = []        # [[event, ...]] each one a step
         self.pre = []             # events before the first step (setup)
-        self.t0 = first.get('t', 0)
+        self.t0 = events[0].get('t', 0)
 
 
 class Message:
-    __slots__ = ('key', 'src', 'dst', 'sclk', 'payload', 'send_ev', 'send_step',
-                 'recv_ev', 'recv_step', 'why', 'value')
+    __slots__ = ('key', 'src', 'dst', 'sclk', 'value', 'send_ev', 'send_step',
+                 'recv_ev', 'recv_step')
 
     def __init__(self):
         for f in self.__slots__:
@@ -529,6 +501,11 @@ class Trace:
                        key=lambda f: (f != main, f))
         self.src = SourceMap(files, data.get('sources'))
         self.main_file = main
+        self.classes = sorted({p.cls for p in self.procs.values()
+                               if not p.is_main})
+
+    def decode(self, v):
+        return decode_value(v, self.pids)
 
     # ---- naming: Cls:1, Cls:2, ... in creation order; main() is 'main'
     def _name_processes(self):
@@ -552,7 +529,6 @@ class Trace:
             short = '<%s:%s>' % (name, uid.split('.')[0][-5:])
             p.pid = ReplayPid(p.id, p.key, p.cls, short)
             self.pids[p.id] = p.pid
-        self.by_key = {p.key: p for p in self.procs.values()}
 
     def key(self, pid):
         p = self.procs.get(pid)
@@ -575,15 +551,8 @@ class Trace:
         """Topological order of all segments: each process' own order,
         send before receive, start() before the started process runs;
         otherwise by recorded time."""
-        segs = [(p.id, i) for p in self.procs.values()
-                for i in range(len(p.segments))]
-        where = {}            # (pid, seq) -> (pid, segment index)
-        for p in self.procs.values():
-            for i, seg in enumerate(p.segments):
-                for e in seg:
-                    where[(p.id, e['seq'])] = (p.id, i)
-        sends = collections.defaultdict(list)    # (src, dst, sclk) -> where
-        starts = {}                              # child -> where
+        sends = collections.defaultdict(list)    # (src, dst, sclk) -> segment
+        starts = {}                              # child -> segment
         for p in self.procs.values():
             for i, seg in enumerate(p.segments):
                 for e in seg:
@@ -593,12 +562,11 @@ class Trace:
                     elif e['kind'] == 'startcall':
                         for c in e.get('procs', []):
                             starts.setdefault(c, (p.id, i))
-        deps = collections.defaultdict(set)
+        deps = {}             # (pid, segment index) -> segments it follows
         for p in self.procs.values():
             for i, seg in enumerate(p.segments):
                 me = (p.id, i)
-                if i > 0:
-                    deps[me].add((p.id, i - 1))
+                deps[me] = {(p.id, i - 1)} if i > 0 else set()
                 head = seg[0]
                 if head['kind'] == 'recv':
                     cands = sends.get((head['src'], p.id, head.get('sclk')))
@@ -606,18 +574,17 @@ class Trace:
                         deps[me].add(cands[0])
                 if head['kind'] == 'run' and p.id in starts:
                     deps[me].add(starts[p.id])
-        for me in list(deps):
-            deps[me].discard(me)
+                deps[me].discard(me)
         users = collections.defaultdict(set)
-        indeg = {}
-        for s in segs:
-            indeg[s] = len(deps[s])
-            for d in deps[s]:
+        for s, ds in deps.items():
+            for d in ds:
                 users[d].add(s)
+        indeg = {s: len(ds) for s, ds in deps.items()}
+
         def prio(s):
             p = self.procs[s[0]]
             return (p.segments[s[1]][0].get('t', 0), p.key, s[1])
-        heap = [(prio(s), s) for s in segs if indeg[s] == 0]
+        heap = [(prio(s), s) for s in deps if indeg[s] == 0]
         heapq.heapify(heap)
         order = []
         while heap:
@@ -627,24 +594,16 @@ class Trace:
                 indeg[u] -= 1
                 if indeg[u] == 0:
                     heapq.heappush(heap, (prio(u), u))
-        if len(order) < len(segs):       # inconsistent trace: keep the rest
+        if len(order) < len(deps):       # inconsistent trace: keep the rest
             done = set(order)
-            order += sorted((s for s in segs if s not in done), key=prio)
+            order += sorted((s for s in deps if s not in done), key=prio)
         self.steps = [{'pid': s[0], 'seg': s[1],
                        'events': self.procs[s[0]].segments[s[1]]}
                       for s in order]
-        self.step_of = {}               # (pid, seq) -> step index
-        for k, st in enumerate(self.steps):
-            for e in st['events']:
-                self.step_of[(st['pid'], e['seq'])] = k
         ts = [st['events'][0].get('t', 0) for st in self.steps]
-        self.t0 = min(ts) if ts else 0
+        t0 = min(ts, default=0)
         # monotone step times (the order can put a later-recorded step first)
-        self.times = []
-        last = 0.0
-        for t in ts:
-            last = max(last, t - self.t0)
-            self.times.append(last)
+        self.times = [t - t0 for t in itertools.accumulate(ts, max)]
 
     def _messages(self):
         """Pair every send with its receive."""
@@ -652,25 +611,27 @@ class Trace:
         chan_count = collections.Counter()
         unmatched = collections.defaultdict(collections.deque)  # (src, dst)
         by_clock = {}
+
+        def new(src, dst, e):
+            m = Message()
+            chan = (self.key(src), self.key(dst))
+            chan_count[chan] += 1
+            m.key = '%s>%s#%d' % (chan + (chan_count[chan],))
+            m.src, m.dst, m.sclk = src, dst, e.get('sclk')
+            m.value = self.decode(e.get('payload'))
+            self.messages.append(m)
+            return m
+
         for k, st in enumerate(self.steps):
-            p = self.procs[st['pid']]
             for e in st['events']:
                 if e['kind'] != 'send':
                     continue
                 for d in e.get('to', []):
-                    m = Message()
-                    chan_count[(p.key, self.key(d))] += 1
-                    m.key = '%s>%s#%d' % (p.key, self.key(d),
-                                          chan_count[(p.key, self.key(d))])
-                    m.src, m.dst, m.sclk = p.id, d, e.get('sclk')
-                    m.payload = e.get('payload')
-                    m.value = decode_value(m.payload, self.pids)
+                    m = new(st['pid'], d, e)
                     m.send_ev, m.send_step = e, k
-                    m.recv_ev = m.recv_step = None
-                    self.messages.append(m)
-                    unmatched[(p.id, d)].append(m)
+                    unmatched[(m.src, d)].append(m)
                     if isinstance(m.sclk, int):
-                        by_clock.setdefault((p.id, d, m.sclk), m)
+                        by_clock.setdefault((m.src, d, m.sclk), m)
         self.recv_msg = {}              # (pid, seq) of a recv -> Message
         for k, st in enumerate(self.steps):
             for e in st['events']:
@@ -687,19 +648,9 @@ class Trace:
                         q.popleft()
                     m = q[0] if q else None
                 if m is None:          # sender not recorded: make one up
-                    m = Message()
-                    chan_count[(self.key(e['src']), self.key(st['pid']))] += 1
-                    m.key = '%s>%s#%d' % (
-                        self.key(e['src']), self.key(st['pid']),
-                        chan_count[(self.key(e['src']), self.key(st['pid']))])
-                    m.src, m.dst, m.sclk = e['src'], st['pid'], e.get('sclk')
-                    m.payload = e.get('payload')
-                    m.value = decode_value(m.payload, self.pids)
-                    m.send_ev = m.send_step = None
-                    self.messages.append(m)
+                    m = new(e['src'], st['pid'], e)
                 m.recv_ev, m.recv_step = e, k
                 self.recv_msg[(st['pid'], e['seq'])] = m
-        self.msg_by_key = {m.key: m for m in self.messages}
         self.sent_msgs = collections.defaultdict(list)  # (pid, seq) of a send
         self.recv_index = {}               # (dst, src, sclk) -> Message
         for m in self.messages:
@@ -737,42 +688,34 @@ class ProcView:
         return repr(self.id)
 
 
-class ReplaySession:
-    """A recorded run and a cursor into its steps.  It answers the same
-    requests as DistAlgo Live's Session, so the page can be shared."""
+class Timeline:
+    """The run at each step, independent of a cursor: the system's state,
+    the messages in flight, and the history (events, state changes, output)
+    with the code that caused it."""
 
-    HISTORY = ('events', 'logs', 'changes')
-
-    def __init__(self, path):
-        self.trace = Trace(load(path))
-        self.src = self.trace.src
-        self.cursor = 0
-        self.gen = 1
-        self.now = 0.0
-        self.last_stop = None
-        self.conditions = []
-        self.breaklines = set()           # (file, line)
+    def __init__(self, trace):
+        self.trace = trace
+        self.src = trace.src
+        self._at = None          # (step, procs, in flight) of the last at()
         self._build_history()
-        self._load_program_namespace()
-        self.now = self._time(0)
 
     # ---- explanations ------------------------------------------------
-    def _frames_locs(self, frames):
-        out = []
-        for fr in frames or ():
-            d = self.src.loc(fr['file'], fr['line'])
-            d['func'] = 'receive' if _HANDLER_RE.match(fr['func']) else fr['func']
-            out.append(d)
-        return out
+    def frame_loc(self, fr, main):
+        d = self.src.loc(fr['file'], fr['line'])
+        func = fr['func']
+        d['func'] = MAIN if main and func == 'run' else (
+            'receive' if _HANDLER_RE.match(func) else func)
+        return d
 
     def _await_before(self, pid, seq):
         """Where `pid` was waiting just before its event `seq`."""
-        p = self.trace.procs[pid]
-        for e in reversed(p.events):
-            if e['seq'] < seq and e['kind'] == 'await' and e.get('frames'):
+        for e in reversed(self.trace.procs[pid].events):
+            if e['seq'] >= seq:
+                continue
+            if e['kind'] == 'await' and e.get('frames'):
                 fr = e['frames'][0]
                 return self.src.await_loc(fr['file'], fr['line'])
-            if e['seq'] < seq and e['kind'] in ('run', 'setup'):
+            if e['kind'] in ('run', 'setup'):
                 break
         return None
 
@@ -784,17 +727,17 @@ class ReplaySession:
                                           msg.get('sclk')))
 
     def _cause(self, pid, cause, seq):
+        T = self.trace
         if not cause:
             return {'type': 'run'}
         if cause.get('type') == 'handler':
             m = self._msg_for(pid, cause.get('msg'))
-            pids = self.trace.pids
             return {'type': 'handler',
                     'payload': fmt(m.value) if m else '?',
-                    'src': self.trace.key(m.src) if m else '?',
+                    'src': T.key(m.src) if m else '?',
                     'msg': m.key if m else None,
                     'deliveredStep': m.recv_step if m else None,
-                    'bindings': {k: fmt(decode_value(v, pids))
+                    'bindings': {k: fmt(T.decode(v))
                                  for k, v in (cause.get('bindings') or {}).items()}}
         after = cause.get('after') or {}
         out = {'type': 'run'}
@@ -802,7 +745,7 @@ class ReplaySession:
             m = self._msg_for(pid, after)
             if m is not None:
                 out['after'] = {'type': 'message', 'msg': m.key,
-                                'src': self.trace.key(m.src),
+                                'src': T.key(m.src),
                                 'payload': fmt(m.value),
                                 'deliveredStep': m.recv_step,
                                 'await': self._await_before(pid, m.recv_ev['seq'])}
@@ -811,457 +754,200 @@ class ReplaySession:
                             'await': self._await_before(pid, seq)}
         return out
 
-    def _why(self, pid, e, step, frames=None):
-        frames = frames if frames is not None else e.get('frames')
+    def _why(self, pid, e):
+        frames = e.get('frames')
         cause = e.get('cause')
-        stack = self._frames_locs(frames)
+        main = self.trace.procs[pid].is_main
+        stack = [self.frame_loc(fr, main) for fr in frames or ()]
+        line, entries = None, []
         if frames:
             fr = frames[0]
             line = self.src.loc(fr['file'], fr['line'])
             entries = self.src.entry_chain(fr['file'], fr['line'])
-            awaits = [i for i, d in enumerate(entries) if d['kind'] == 'await']
-            if e['kind'] in ('await', 'handler') and awaits:
+            w = next((d for d in entries if d['kind'] == 'await'), None)
+            if e['kind'] in ('await', 'handler') and w:
                 # at an await's label: the label call has a nearby line
-                entries = entries[awaits[0]:]
-                line = {k: v for k, v in entries[0].items() if k != 'kind'}
-                stack[0] = dict(stack[0], line=line['line'],
-                                text=line['text'])
+                entries = entries[entries.index(w):]
+                line = {k: v for k, v in w.items() if k != 'kind'}
+                stack[0].update(line=w['line'], text=w['text'])
         elif cause and cause.get('type') == 'handler' and cause.get('file'):
             line = self.src.loc(cause['file'], cause['line'])
-            entries = []
-        else:
-            line, entries = None, []
         return {'line': line or {'block': None, 'line': None, 'text': ''},
                 'entries': entries, 'stack': stack,
-                'cause': self._cause(pid, cause, e['seq']), 'step': step}
+                'cause': self._cause(pid, cause, e['seq'])}
 
     # ---- history (events, changes, logs), computed once ---------------
     def _build_history(self):
         T = self.trace
-        events, changes, logs = [], [], []
-        self._step_lines = []                 # step -> set of (file, line)
-        last_state = {}                       # pid -> fields so far
+        self.events, self.changes, self.logs = [], [], []
+        self.step_lines = []                  # step -> set of (file, line)
+        procs, net = {}, {}
+
+        def log(k, pid, text, kind='system'):
+            self.logs.append({'step': k, 'pid': pid, 'kind': kind,
+                              'text': text})
+
         for k, st in enumerate(T.steps):
             pid = st['pid']
             p = T.procs[pid]
+            # the fields changed since the process' last event: by the
+            # handler that just ran ('handled'), or else by run()
+            for e, fields, old in self._apply(procs, net, k):
+                why = self._why(pid, e)
+                for f in fields:
+                    self.changes.append({
+                        'step': k, 'pid': p.key, 'field': f,
+                        'old': fmt(T.decode(old[f])) if f in old else None,
+                        'new': fmt(T.decode(e['state'][f])), 'why': why})
             lines = set()
-            if pid not in last_state:
-                last_state[pid] = self._setup_state(pid)
             for e in st['events']:
                 kind = e['kind']
                 for fr in (e.get('frames') or ())[:1]:
                     lines.add((fr['file'], fr['line']))
-                if kind == 'handled':
-                    c = e.get('cause') or {}
-                    if c.get('file'):
-                        lines.add((c['file'], c['line']))
+                c = e.get('cause') or {}
+                if kind == 'handled' and c.get('file'):
+                    lines.add((c['file'], c['line']))
                 if kind == 'run':
-                    logs.append(self._log(k, p.key, 'starts running',
-                                          'system'))
+                    log(k, p.key, 'starts running')
                 elif kind == 'recv':
                     m = T.recv_msg.get((pid, e['seq']))
                     if m is not None:
-                        events.append({'kind': 'recv', 'step': k,
-                                       'src': T.key(m.src), 'dst': p.key,
-                                       'key': m.key, 'payload': fmt(m.value),
-                                       'sendStep': m.send_step,
-                                       'clk': e.get('clk')})
-                        logs.append(self._log(k, p.key, 'delivered %s from %s'
-                                              % (fmt(m.value),
-                                                 '<%s>' % T.key(m.src)),
-                                              'system'))
+                        self.events.append({
+                            'kind': 'recv', 'step': k, 'src': T.key(m.src),
+                            'dst': p.key, 'key': m.key, 'payload': fmt(m.value)})
+                        log(k, p.key, 'delivered %s from <%s>'
+                            % (fmt(m.value), T.key(m.src)))
                 elif kind == 'timeout':
-                    logs.append(self._log(k, p.key, 'timeout fired', 'system'))
+                    log(k, p.key, 'timeout fired')
                 elif kind == 'send':
-                    why = self._why(pid, e, k)
+                    why = self._why(pid, e)
                     for m in T.sent_msgs[(pid, e['seq'])]:
-                            m.why = why
-                            events.append({'kind': 'send', 'step': k,
-                                           'src': p.key, 'dst': T.key(m.dst),
-                                           'key': m.key,
-                                           'payload': fmt(m.value),
-                                           'clk': m.sclk, 'why': why})
+                        self.events.append({
+                            'kind': 'send', 'step': k, 'src': p.key,
+                            'dst': T.key(m.dst), 'key': m.key,
+                            'payload': fmt(m.value), 'why': why})
                 elif kind == 'output':
-                    logs.append(self._log(k, p.key, e.get('text', ''),
-                                          'print'))
+                    log(k, p.key, e.get('text', ''), 'print')
                 elif kind == 'new':
                     for c in e.get('children', []):
-                        logs.append(self._log(k, p.key, 'created %r' %
-                                              T.pids.get(c, c), 'system'))
+                        log(k, p.key, 'created %r' % T.pids.get(c, c))
                 elif kind == 'end':
-                    st_ = e.get('status')
+                    status = e.get('status')
                     text = {'done': 'run() finished', 'exited': 'exited',
                             'crashed': 'crashed: %s' % e.get('error')}.get(
-                                st_, st_)
-                    logs.append(self._log(k, p.key, text,
-                                          'error' if st_ == 'crashed'
-                                          else 'system'))
-                if kind == 'setupcall':
-                    # the children's setup() ran now
-                    for c in e.get('procs', []):
-                        last_state[c] = self._setup_state(c)
-                if e.get('state'):
-                    # the fields changed since the process' last event: by
-                    # the handler that just ran ('handled'), or else by run()
-                    old = last_state[pid]
-                    changed = [f for f, v in e['state'].items()
-                               if old.get(f, changes) != v]
-                    if changed:
-                        why = self._why(pid, e, k)
-                        for f in changed:
-                            changes.append({
-                                'step': k, 'pid': p.key, 'field': f,
-                                'old': fmt(decode_value(old[f], T.pids))
-                                if f in old else None,
-                                'new': fmt(decode_value(e['state'][f],
-                                                        T.pids)),
-                                'why': why})
-                    last_state[pid] = dict(old, **e['state'])
-            self._step_lines.append(lines)
-        self.events, self.changes, self.logs = events, changes, logs
+                                status, status)
+                    log(k, p.key, text,
+                        'error' if status == 'crashed' else 'system')
+            self.step_lines.append(lines)
 
+    # ---- the system at a step ----------------------------------------
     def _setup_state(self, pid):
         """A process' fields after its setup() (before its first step)."""
         state = {}
-        p = self.trace.procs.get(pid)
-        for e in (p.pre if p else ()):
+        for e in self.trace.procs[pid].pre:
             state.update(e.get('state') or {})
         return state
 
-    @staticmethod
-    def _log(step, pid, text, kind):
-        return {'step': step, 'pid': pid, 'kind': kind, 'text': text}
+    def _proc(self, procs, pid):
+        """The state of `pid` in `procs`, made when first needed; None for a
+        process that was not recorded."""
+        p = self.trace.procs.get(pid)
+        if p is not None and pid not in procs:
+            procs[pid] = {'pid': p.pid, 'key': p.key, 'cls': p.cls,
+                          'main': p.is_main, 'status': 'created',
+                          'state': {}, 'values': {}, 'frames': [],
+                          'waiting': None, 'clock': None, 'sent': [],
+                          'received': [], 'error': None}
+        return procs.get(pid)
 
-    def _prefix(self, items):
-        """The items of steps up to the cursor (lists are sorted by step)."""
-        n = 0
-        while n < len(items) and items[n]['step'] <= self.cursor:
-            n += 1
-        return items[:n]
+    def _setup(self, s, pid):
+        s['state'] = self._setup_state(pid)
+        s['values'] = {f: self.trace.decode(v) for f, v in s['state'].items()}
 
-    # ---- the system at the cursor ------------------------------------
-    def _states(self, upto=None):
-        """{pid: process state} after steps 0..upto."""
+    def _apply(self, procs, net, k):
+        """Applies step k to `procs` ({pid: state}) and `net` ({key: message
+        in flight}); returns the field changes [(event, fields, old state)]."""
         T = self.trace
-        upto = self.cursor if upto is None else upto
-        out = collections.OrderedDict()
-
-        def ensure(pid):
-            if pid not in out:
-                p = T.procs.get(pid)
-                if p is None:
-                    return None
-                out[pid] = {'pid': p.pid, 'key': p.key, 'cls': p.cls,
-                            'main': p.is_main, 'status': 'created',
-                            'state': {}, 'frames': [], 'waiting': None,
-                            'clock': None, 'sent': [], 'received': [],
-                            'error': None}
-            return out[pid]
-
-        for k in range(min(upto, len(T.steps) - 1) + 1):
-            st = T.steps[k]
-            s = ensure(st['pid'])
-            if s is None:
-                continue
-            if s['status'] in ('created', 'setup', 'ready'):
-                s['state'] = self._setup_state(st['pid'])
-            s['status'] = 'running'
-            s['waiting'] = None
-            for e in st['events']:
-                kind = e['kind']
-                s['clock'] = e.get('clk', s['clock'])
-                if e.get('state'):
-                    s['state'] = dict(s['state'], **e['state'])
-                if e.get('frames'):
-                    s['frames'] = e['frames']     # where it is
-                if e.get('locals') is not None:
-                    s['main_locals'] = e['locals']   # main()'s variables
-                if kind == 'new':
-                    for c in e.get('children', []):
-                        ensure(c)
-                elif kind == 'setupcall':
-                    for c in e.get('procs', []):
-                        cs = ensure(c)
-                        if cs is None:
-                            continue
-                        cs['state'] = self._setup_state(c)
+        st = T.steps[k]
+        pid = st['pid']
+        s = self._proc(procs, pid)
+        if s['status'] in ('created', 'setup', 'ready'):
+            self._setup(s, pid)
+        s['status'] = 'running'
+        s['waiting'] = None
+        changes = []
+        for e in st['events']:
+            kind = e['kind']
+            s['clock'] = e.get('clk', s['clock'])
+            if e.get('state'):
+                old = s['state']
+                fields = [f for f, v in e['state'].items()
+                          if f not in old or old[f] != v]
+                if fields:
+                    changes.append((e, fields, old))
+                s['state'] = dict(old, **e['state'])
+                s['values'] = dict(s['values'], **{
+                    f: T.decode(e['state'][f]) for f in fields})
+            if e.get('frames'):
+                s['frames'] = e['frames']     # where it is
+            if e.get('locals') is not None:
+                s['main_locals'] = e['locals']   # main()'s variables
+            if kind == 'new':
+                for c in e.get('children', []):
+                    self._proc(procs, c)
+            elif kind == 'setupcall':
+                for c in e.get('procs', []):
+                    cs = self._proc(procs, c)
+                    if cs is not None:
+                        self._setup(cs, c)
                         if cs['status'] == 'created':
                             cs['status'] = 'setup'
-                elif kind == 'startcall':
-                    for c in e.get('procs', []):
-                        cs = ensure(c)
-                        if cs is not None and cs['status'] in ('created',
-                                                               'setup'):
-                            cs['status'] = 'ready'
-                elif kind == 'send':
-                    for m in T.sent_msgs[(st['pid'], e['seq'])]:
-                        s['sent'].append((m.value, T.pids.get(m.dst, m.dst)))
-                elif kind == 'recv':
-                    m = T.recv_msg.get((st['pid'], e['seq']))
-                    if m is not None:
-                        s['received'].append((m.value, T.pids.get(m.src,
-                                                                  m.src)))
-                elif kind == 'await':
-                    s['status'] = 'blocked'
-                    s['frames'] = e.get('frames') or []
-                    if e.get('frames'):
-                        fr = e['frames'][0]
-                        w = self.src.await_loc(fr['file'], fr['line'])
-                        w['timeout'] = e.get('timeout')
-                        s['waiting'] = w
-                elif kind == 'end':
-                    s['status'] = e.get('status') or 'done'
-                    s['error'] = e.get('error')
-                    s['frames'] = []
-        for s in out.values():
-            s['values'] = {k: decode_value(v, T.pids)
-                           for k, v in s['state'].items()}
-        return out
+            elif kind == 'startcall':
+                for c in e.get('procs', []):
+                    cs = self._proc(procs, c)
+                    if cs is not None and cs['status'] in ('created', 'setup'):
+                        cs['status'] = 'ready'
+            elif kind == 'send':
+                for m in T.sent_msgs[(pid, e['seq'])]:
+                    s['sent'].append((m.value, T.pids.get(m.dst, m.dst)))
+                    if m.recv_step is None or m.recv_step > k:
+                        net[m.key] = m
+            elif kind == 'recv':
+                m = T.recv_msg.get((pid, e['seq']))
+                if m is not None:
+                    s['received'].append((m.value, T.pids.get(m.src, m.src)))
+                    net.pop(m.key, None)
+            elif kind == 'await':
+                s['status'] = 'blocked'
+                s['frames'] = e.get('frames') or []
+                if e.get('frames'):
+                    fr = e['frames'][0]
+                    w = self.src.await_loc(fr['file'], fr['line'])
+                    w['timeout'] = e.get('timeout')
+                    s['waiting'] = w
+            elif kind == 'end':
+                s['status'] = e.get('status') or 'done'
+                s['error'] = e.get('error')
+                s['frames'] = []
+        return changes
 
-    def _network(self, upto=None):
-        upto = self.cursor if upto is None else upto
-        return [m for m in self.trace.messages
-                if m.send_step is not None and m.send_step <= upto and
-                (m.recv_step is None or m.recv_step > upto)]
+    def at(self, k):
+        """({pid: process state}, [messages in flight]) after steps 0..k,
+        updated from the last call's (so do not keep them)."""
+        k = min(k, len(self.trace.steps) - 1)
+        if self._at is None or self._at[0] > k:
+            self._at = (-1, {}, {})
+        j, procs, net = self._at
+        for i in range(j + 1, k + 1):
+            self._apply(procs, net, i)
+        self._at = (k, procs, net)
+        return procs, list(net.values())
 
-    def _time(self, k):
-        if not self.trace.times:
-            return 0.0
-        return self.trace.times[max(0, min(k, len(self.trace.times) - 1))]
-
-    def _action(self, k):
-        """The step k as a DistAlgo Live scheduler action."""
-        if k is None or not (0 <= k < len(self.trace.steps)):
-            return None
-        st = self.trace.steps[k]
-        head = st['events'][0]
-        key = self.trace.procs[st['pid']].key
-        if head['kind'] == 'recv':
-            m = self.trace.recv_msg.get((st['pid'], head['seq']))
-            return {'type': 'deliver', 'msg': m.key if m else None}
-        if head['kind'] == 'timeout':
-            return {'type': 'timeout', 'pid': key}
-        return {'type': 'run', 'pid': key}
-
-    def snapshot(self, since=None):
+    def scope(self, k):
+        """The names a condition sees at step k."""
         T = self.trace
-        states = self._states()
-        procs = []
-        for pid, s in states.items():
-            frames = []
-            for fr in reversed(s['frames']):       # outermost first
-                d = self.src.loc(fr['file'], fr['line'])
-                d['func'] = MAIN if (s['main'] and fr['func'] == 'run') else (
-                    'receive' if _HANDLER_RE.match(fr['func']) else fr['func'])
-                frames.append(d)
-            if frames and s['waiting']:
-                # A blocked process is at its await: the compiler gives the
-                # blocking label call a nearby statement's line, so use the
-                # await's location (as its card does) for the innermost frame.
-                w = s['waiting']
-                frames[-1].update(block=w['block'], line=w['line'],
-                                  text=w['text'])
-            procs.append({
-                'id': s['key'], 'cls': s['cls'], 'realId': pid,
-                'status': s['status'], 'isMain': s['main'],
-                'waitingAt': s['waiting'], 'pausedAt': None,
-                'clock': s['clock'],
-                'state': {k: fmt(v) for k, v in s['values'].items()},
-                'frames': frames, 'queue': [],
-                'sent': len(s['sent']), 'received': len(s['received']),
-                'error': s['error']})
-        net = []
-        for m in self._network():
-            sent_at = self._time(m.send_step)
-            arrives = self._time(m.recv_step) if m.recv_step is not None \
-                else None
-            net.append({'key': m.key, 'src': T.key(m.src), 'dst': T.key(m.dst),
-                        'payload': fmt(m.value), 'clk': m.sclk,
-                        'sentStep': m.send_step,
-                        'sentAt': round(sent_at, 6),
-                        'arrives': round(arrives, 6) if arrives is not None
-                        else None,
-                        'recvStep': m.recv_step})
-        snap = {
-            'running': True, 'gen': self.gen, 'delta': False,
-            'step': self.cursor, 'time': round(self.now, 6),
-            'processes': procs, 'network': net,
-            'events': self._prefix(self.events),
-            'changes': self._prefix(self.changes),
-            'logs': self._prefix(self.logs),
-            'next': self._action(self.cursor + 1),
-            'nextTime': self._time(self.cursor + 1)
-            if self.cursor + 1 < len(T.steps) else None,
-            'classes': sorted({p.cls for p in T.procs.values()
-                               if not p.is_main}),
-            'timers': [],
-            'cursor': self.cursor,
-            'redo': max(0, len(T.steps) - 1 - self.cursor),
-            'total': len(T.steps),
-            'lastAction': self._action(self.cursor),
-            'paused': None,
-            'lastStop': self.last_stop,
-        }
-        snap['conditions'] = [
-            {'id': c['id'], 'expr': c['expr'], 'enabled': c['enabled'],
-             'value': v, 'error': err}
-            for c, (_, v, err) in zip(self.conditions,
-                                      self.eval_conditions(states))]
-        snap['conditionNames'] = self.condition_names(states)
-        snap['conditionExample'] = self.condition_example(states)
-        if since and since.get('gen') == self.gen:
-            # The history lists only grow with the step, so the page needs
-            # only what it does not have yet; after a step back, only how
-            # many items to keep ('trim').
-            snap['delta'] = True
-            snap['trim'] = {}
-            for k in self.HISTORY:
-                have = max(0, int(since.get(k, 0)))
-                if have <= len(snap[k]):
-                    snap[k] = snap[k][have:]
-                else:
-                    snap['trim'][k] = len(snap[k])
-                    snap[k] = []
-        return snap
-
-    def info(self):
-        T = self.trace
-        return {'logdir': T.data.get('path'),
-                'program': T.main_file,
-                'steps': len(T.steps),
-                'processes': len(T.procs),
-                'messages': len(T.messages),
-                'blocks': [{'name': b['name'], 'code': b['code'],
-                            'kind': b['kind']} for b in self.src.blocks]}
-
-    # ---- moving through the steps ---------------------------------------
-    def goto(self, k):
-        self.cursor = max(0, min(int(k), len(self.trace.steps) - 1))
-        self.now = self._time(self.cursor)
-
-    def forward(self):
-        if self.cursor + 1 >= len(self.trace.steps):
-            return False
-        self.goto(self.cursor + 1)
-        return True
-
-    def back(self):
-        if self.cursor == 0:
-            return False
-        self.goto(self.cursor - 1)
-        return True
-
-    def _hit_line(self, k):
-        hits = self._step_lines[k] & self.breaklines
-        if not hits:
-            return None
-        fn, line = sorted(hits)[0]
-        return {'reason': 'line', 'pid': self.trace.procs[
-            self.trace.steps[k]['pid']].key, 'at': self.src.loc(fn, line)}
-
-    def run_until(self, max_steps=100000):
-        """Step until a step reaches a breakpoint line, a condition becomes
-        true, or the run ends."""
-        before = {cid: v for cid, v, _ in self.eval_conditions()}
-        for n in range(max_steps):
-            if not self.forward():
-                self.last_stop = {'reason': 'quiet', 'steps': n}
-                return self.last_stop
-            hit = self._hit_line(self.cursor)
-            if hit:
-                hit['steps'] = n + 1
-                self.last_stop = hit
-                return hit
-            now = {cid: v for cid, v, _ in self.eval_conditions()}
-            ids = [cid for cid, v in now.items()
-                   if v and not before.get(cid) and
-                   self.conditions[cid]['enabled']]
-            before = now
-            if ids:
-                self.last_stop = {'reason': 'condition', 'ids': ids,
-                                  'steps': n + 1}
-                return self.last_stop
-        self.last_stop = {'reason': 'limit', 'steps': max_steps}
-        return self.last_stop
-
-    def advance(self, dt):
-        """Real-time play: move the clock by dt (recorded seconds) and take
-        the steps that happened by then."""
-        self.last_stop = None
-        target = self.now + max(0.0, float(dt))
-        before = {cid: v for cid, v, _ in self.eval_conditions()}
-        n = 0
-        while self.cursor + 1 < len(self.trace.steps) and \
-                self._time(self.cursor + 1) <= target:
-            self.cursor += 1
-            n += 1
-            hit = self._hit_line(self.cursor)
-            if hit:
-                hit['steps'] = n
-                self.last_stop = hit
-                self.now = self._time(self.cursor)
-                return
-            now = {cid: v for cid, v, _ in self.eval_conditions()}
-            ids = [cid for cid, v in now.items()
-                   if v and not before.get(cid) and
-                   self.conditions[cid]['enabled']]
-            before = now
-            if ids:
-                self.last_stop = {'reason': 'condition', 'ids': ids,
-                                  'steps': n}
-                self.now = self._time(self.cursor)
-                return
-        self.now = target
-        if self.cursor + 1 >= len(self.trace.steps):
-            self.last_stop = {'reason': 'quiet', 'steps': n}
-
-    # ---- breakpoints and conditions -----------------------------------
-    def set_breaklines(self, blocks_lines):
-        """blocks_lines: {block name: [line, ...]} (1-based, per block)."""
-        out = set()
-        for name, lines in (blocks_lines or {}).items():
-            for ln in lines:
-                fn, line = self.src.file_line(name, int(ln))
-                if fn:
-                    out.add((fn, line))
-        self.breaklines = out
-
-    def set_conditions(self, conds):
-        self.conditions = [{'id': i, 'expr': c.get('expr', ''),
-                            'enabled': c.get('enabled', True),
-                            'fn': None, 'error': None}
-                           for i, c in enumerate(conds or [])]
-        for c in self.conditions:
-            if not c['expr'].strip():
-                continue
-            try:
-                c['fn'] = compile_query(c['expr'])
-            except CompileError as e:
-                c['error'] = str(e)
-
-    def _load_program_namespace(self):
-        """The program's module-level names (helpers and constants), for
-        conditions.  main() is not run."""
-        self.namespace = {}
-        fn = self.trace.main_file
-        src = self.src.text.get(fn) if fn else None
-        if src is None:
-            return
-        try:
-            args = daui.parse_compiler_args([])
-            with _quiet_compiler(io.StringIO()):
-                code = daui.dastr_to_pycode(src, fn, args)
-                ns = {'__name__': '__dareplay__', '__file__': fn}
-                if code is not None:
-                    exec(code, ns)
-            self.namespace = ns
-        except Exception:
-            self.namespace = {}
-
-    def query_scope(self, states=None):
-        states = self._states() if states is None else states
-        T = self.trace
-        views = {s['pid']: ProcView(s) for s in states.values()
+        procs, net = self.at(k)
+        views = {s['pid']: ProcView(s) for s in procs.values()
                  if not s['main']}
 
         def viewify(v, depth=0):
@@ -1273,27 +959,116 @@ class ReplaySession:
             return v
 
         scope = {}
-        for s in states.values():
-            if not s['main']:
-                continue
-            # main()'s variables, as of its latest recorded event
-            for k, v in (s.get('main_locals') or {}).items():
-                scope[k] = viewify(decode_value(v, T.pids))
+        for s in procs.values():
+            if s['main']:
+                # main()'s variables, as of its latest recorded event
+                for name, v in (s.get('main_locals') or {}).items():
+                    scope[name] = viewify(T.decode(v))
         allv = list(views.values())
         scope.update({'procs': allv,
                       'network': [(views.get(T.pids.get(m.src), m.src),
                                    views.get(T.pids.get(m.dst), m.dst),
-                                   m.value) for m in self._network()],
-                      'step': self.cursor})
-        for cls in sorted({p.cls for p in T.procs.values() if not p.is_main}):
+                                   m.value) for m in net],
+                      'step': k})
+        for cls in T.classes:
             scope[cls] = [v for v in allv if v.cls == cls]
         return scope
 
-    def condition_example(self, states=None):
-        """An example condition for this program, for the input's
-        placeholder: some(p in <a variable of main() holding processes>,
+    def time(self, k):
+        times = self.trace.times
+        return times[max(0, min(k, len(times) - 1))] if times else 0.0
+
+    def action(self, k):
+        """The step k as a DistAlgo Live scheduler action."""
+        if k is None or not (0 <= k < len(self.trace.steps)):
+            return None
+        st = self.trace.steps[k]
+        head = st['events'][0]
+        if head['kind'] == 'recv':
+            m = self.trace.recv_msg.get((st['pid'], head['seq']))
+            return {'type': 'deliver', 'msg': m.key if m else None}
+        key = self.trace.procs[st['pid']].key
+        return {'type': 'timeout' if head['kind'] == 'timeout' else 'run',
+                'pid': key}
+
+
+def _upto(items, k):
+    """The items of steps up to k (`items` is sorted by step)."""
+    n = 0
+    while n < len(items) and items[n]['step'] <= k:
+        n += 1
+    return items[:n]
+
+
+# --------------------------------------------------------------------------
+# Conditions
+# --------------------------------------------------------------------------
+
+class Conditions:
+    """Conditions over the whole system: DistAlgo expressions, evaluated in
+    the program's module-level namespace and a scope of the system."""
+
+    def __init__(self, trace):
+        self.items = []
+        self.namespace = {}
+        fn = trace.main_file
+        src = trace.src.text.get(fn) if fn else None
+        if src is None:
+            return
+        try:     # main() is not run
+            code = _da_compile(daui.dastr_to_pycode, src, fn)
+            ns = {'__name__': '__dareplay__', '__file__': fn}
+            if code is not None:
+                with _quiet_compiler():
+                    exec(code, ns)
+            self.namespace = ns
+        except Exception:
+            pass
+
+    def set(self, conds):
+        self.items = [{'id': i, 'expr': c.get('expr', ''),
+                       'enabled': c.get('enabled', True),
+                       'fn': None, 'error': None}
+                      for i, c in enumerate(conds or [])]
+        for c in self.items:
+            if not c['expr'].strip():
+                continue
+            try:
+                c['fn'] = compile_query(c['expr'])
+            except CompileError as e:
+                c['error'] = str(e)
+
+    def evaluate(self, scope):
+        """[(id, value, error)]; `scope()` gives the names they see."""
+        names = None
+        res = []
+        for c in self.items:
+            if c['fn'] is None:
+                res.append((c['id'], None, c['error']))
+                continue
+            if names is None:
+                names = scope()
+            g = dict(self.namespace, da=da)
+            g.update(names)
+            try:
+                fn = types.FunctionType(c['fn'].__code__, g, '_query_')
+                res.append((c['id'], bool(fn()), None))
+            except NameError as e:
+                res.append((c['id'], None, '%s. You can use: %s' % (
+                    e, ', '.join(sorted(names)))))
+            except Exception as e:
+                res.append((c['id'], None, '%s: %s' % (type(e).__name__, e)))
+        return res
+
+    @staticmethod
+    def names(scope):
+        return [n for n in scope if re.match(r'^[A-Za-z_]\w*$', n)]
+
+    @staticmethod
+    def example(scope):
+        """An example condition, for the input's placeholder:
+        some(p in <a variable of main() holding processes>,
         has= p.<field> == <its value now>), else over a process class."""
-        scope = self.query_scope(states)
         groups = []
         for name, v in scope.items():
             if name in ('procs', 'network', 'step'):
@@ -1303,8 +1078,7 @@ class ReplaySession:
                 else [])
             views = [x for x in items if isinstance(x, ProcView)]
             if views:
-                is_class = name[:1].isupper()
-                groups.append((is_class, name, views))
+                groups.append((name[:1].isupper(), name, views))
         groups.sort(key=lambda g: g[0])      # main()'s variables first
         for _, name, views in groups:
             for f, val in views[0].__dict__.items():
@@ -1319,34 +1093,6 @@ class ReplaySession:
             return 'some(p in %s, has= p.status == %r)' % (
                 groups[0][1], groups[0][2][0].status)
         return 'some(p in procs, has= len(p.received) > 0)'
-
-    def condition_names(self, states=None):
-        scope = self.query_scope(states)
-        return [n for n in scope if re.match(r'^[A-Za-z_]\w*$', n)]
-
-    def eval_conditions(self, states=None):
-        if not self.conditions:
-            return []
-        scope = None
-        res = []
-        for c in self.conditions:
-            if c['fn'] is None:
-                res.append((c['id'], None, c['error']))
-                continue
-            if scope is None:
-                scope = self.query_scope(states)
-            try:
-                g = dict(self.namespace)
-                g['da'] = da
-                g.update(scope)
-                fn = types.FunctionType(c['fn'].__code__, g, '_query_')
-                res.append((c['id'], bool(fn()), None))
-            except NameError as e:
-                res.append((c['id'], None, '%s. You can use: %s' % (
-                    e, ', '.join(sorted(scope)))))
-            except Exception as e:
-                res.append((c['id'], None, '%s: %s' % (type(e).__name__, e)))
-        return res
 
 
 class CompileError(Exception):
@@ -1368,9 +1114,7 @@ def compile_query(expr):
     src = 'def _query_():\n    return (%s)\n' % expr
     err = io.StringIO()
     try:
-        with _quiet_compiler(err):
-            pyast = daui.dastr_to_pyast(src, '<condition>',
-                                        daui.parse_compiler_args([]))
+        pyast = _da_compile(daui.dastr_to_pyast, src, '<condition>', err)
     except SyntaxError as e:
         raise CompileError('SyntaxError: %s' % e.msg)
     except Exception as e:
@@ -1389,6 +1133,188 @@ def compile_query(expr):
 
 
 # --------------------------------------------------------------------------
+# A cursor into the run
+# --------------------------------------------------------------------------
+
+class ReplaySession:
+    """A recorded run and a cursor into its steps.  It answers the same
+    requests as DistAlgo Live's Session, so the page can be shared."""
+
+    HISTORY = ('events', 'logs', 'changes')
+
+    def __init__(self, path):
+        self.trace = Trace(load(path))
+        self.src = self.trace.src
+        self.timeline = Timeline(self.trace)
+        self.conds = Conditions(self.trace)
+        self.cursor = 0
+        self.gen = 1
+        self.last_stop = None
+        self.breaklines = set()           # (file, line)
+        self.now = self.timeline.time(0)
+
+    def snapshot(self, since=None):
+        T, tl, k = self.trace, self.timeline, self.cursor
+        states, net = tl.at(k)
+        procs = []
+        for pid, s in states.items():
+            frames = [tl.frame_loc(fr, s['main'])
+                      for fr in reversed(s['frames'])]   # outermost first
+            w = s['waiting']
+            if frames and w:
+                # a blocked process is at its await (as its card shows), not
+                # the nearby line the compiler gives the blocking label call
+                frames[-1].update(block=w['block'], line=w['line'],
+                                  text=w['text'])
+            procs.append({
+                'id': s['key'], 'cls': s['cls'], 'realId': pid,
+                'status': s['status'], 'isMain': s['main'],
+                'waitingAt': w, 'pausedAt': None, 'clock': s['clock'],
+                'state': {f: fmt(v) for f, v in s['values'].items()},
+                'frames': frames, 'queue': [],
+                'sent': len(s['sent']), 'received': len(s['received']),
+                'error': s['error']})
+        network = [{'key': m.key, 'src': T.key(m.src), 'dst': T.key(m.dst),
+                    'payload': fmt(m.value), 'sentStep': m.send_step,
+                    'sentAt': round(tl.time(m.send_step), 6),
+                    'arrives': None if m.recv_step is None
+                    else round(tl.time(m.recv_step), 6),
+                    'recvStep': m.recv_step} for m in net]
+        scope = tl.scope(k)
+        snap = {
+            'running': True, 'gen': self.gen, 'delta': False,
+            'step': k, 'time': round(self.now, 6),
+            'processes': procs, 'network': network,
+            'events': _upto(tl.events, k),
+            'changes': _upto(tl.changes, k),
+            'logs': _upto(tl.logs, k),
+            'next': tl.action(k + 1),
+            'classes': T.classes,
+            'timers': [],
+            'cursor': k,
+            'redo': max(0, len(T.steps) - 1 - k),
+            'lastAction': tl.action(k),
+            'paused': None,
+            'lastStop': self.last_stop,
+            'conditions': [
+                {'id': c['id'], 'expr': c['expr'], 'enabled': c['enabled'],
+                 'value': v, 'error': err}
+                for c, (_, v, err) in zip(self.conds.items,
+                                          self.conds.evaluate(lambda: scope))],
+            'conditionNames': Conditions.names(scope),
+            'conditionExample': Conditions.example(scope),
+        }
+        if since and since.get('gen') == self.gen:
+            # The history lists only grow with the step, so the page needs
+            # only what it does not have yet; after a step back, only how
+            # many items to keep ('trim').
+            snap['delta'] = True
+            snap['trim'] = {}
+            for h in self.HISTORY:
+                have = max(0, int(since.get(h, 0)))
+                if have <= len(snap[h]):
+                    snap[h] = snap[h][have:]
+                else:
+                    snap['trim'][h] = len(snap[h])
+                    snap[h] = []
+        return snap
+
+    def info(self):
+        T = self.trace
+        return {'logdir': T.data.get('path'),
+                'program': T.main_file,
+                'steps': len(T.steps),
+                'processes': len(T.procs),
+                'messages': len(T.messages),
+                'blocks': [{'name': b['name'], 'code': b['code'],
+                            'kind': b['kind']} for b in self.src.blocks]}
+
+    # ---- moving through the steps ---------------------------------------
+    def goto(self, k):
+        self.cursor = max(0, min(int(k), len(self.trace.steps) - 1))
+        self.now = self.timeline.time(self.cursor)
+
+    def forward(self):
+        if self.cursor + 1 >= len(self.trace.steps):
+            return False
+        self.goto(self.cursor + 1)
+        return True
+
+    def back(self):
+        if self.cursor == 0:
+            return False
+        self.goto(self.cursor - 1)
+        return True
+
+    def _hit_line(self, n):
+        """The breakpoint line the step at the cursor reaches, the n-th step
+        of a run."""
+        hits = self.timeline.step_lines[self.cursor] & self.breaklines
+        if not hits:
+            return None
+        fn, line = min(hits)
+        return {'reason': 'line', 'steps': n, 'at': self.src.loc(fn, line),
+                'pid': self.trace.procs[self.trace.steps[self.cursor]['pid']].key}
+
+    def _values(self):
+        return {cid: v for cid, v, _ in self.conds.evaluate(
+            lambda: self.timeline.scope(self.cursor))}
+
+    def _stop(self, n, before):
+        """The stop the step at the cursor, the n-th of a run, reaches, if
+        any; `before`: the conditions' values before it, updated."""
+        hit = self._hit_line(n)
+        if hit:
+            return hit
+        now = self._values()
+        ids = [cid for cid, v in now.items() if v and not before.get(cid) and
+               self.conds.items[cid]['enabled']]
+        before.update(now)
+        return {'reason': 'condition', 'ids': ids, 'steps': n} if ids else None
+
+    def run_until(self, max_steps=100000):
+        """Step until a step reaches a breakpoint line, a condition becomes
+        true, or the run ends."""
+        before = self._values()
+        for n in range(max_steps):
+            if not self.forward():
+                self.last_stop = {'reason': 'quiet', 'steps': n}
+                return
+            self.last_stop = self._stop(n + 1, before)
+            if self.last_stop:
+                return
+        self.last_stop = {'reason': 'limit', 'steps': max_steps}
+
+    def advance(self, dt):
+        """Real-time play: move the clock by dt (recorded seconds) and take
+        the steps that happened by then."""
+        self.last_stop = None
+        target = self.now + max(0.0, float(dt))
+        before = self._values()
+        n = 0
+        while self.cursor + 1 < len(self.trace.steps) and \
+                self.timeline.time(self.cursor + 1) <= target:
+            self.goto(self.cursor + 1)
+            n += 1
+            self.last_stop = self._stop(n, before)
+            if self.last_stop:
+                return
+        self.now = target
+        if self.cursor + 1 >= len(self.trace.steps):
+            self.last_stop = {'reason': 'quiet', 'steps': n}
+
+    def set_breaklines(self, blocks_lines):
+        """blocks_lines: {block name: [line, ...]} (1-based, per block)."""
+        out = set()
+        for name, lines in (blocks_lines or {}).items():
+            for ln in lines:
+                fn, line = self.src.file_line(name, int(ln))
+                if fn:
+                    out.add((fn, line))
+        self.breaklines = out
+
+
+# --------------------------------------------------------------------------
 # HTTP server (from DistAlgo Live's server.py)
 # --------------------------------------------------------------------------
 
@@ -1397,23 +1323,16 @@ SESSION = None
 
 def api(path, body):
     s = SESSION
-    if path == '/api/load':
-        s.last_stop = None
+    if path in ('/api/load', '/api/breakpoints'):
         s.set_breaklines(body.get('breakpoints', {}))
-        s.set_conditions(body.get('conditions', []))
-        snap = s.snapshot()
-        snap['info'] = s.info()
-        return snap
-    if path == '/api/breakpoints':
-        s.set_breaklines(body.get('breakpoints', {}))
-        s.set_conditions(body.get('conditions', []))
+        s.conds.set(body.get('conditions', []))
+        if path == '/api/load':
+            s.last_stop = None
+            return dict(s.snapshot(), info=s.info())
     elif path == '/api/step':
         s.last_stop = None
         if s.forward():
-            hit = s._hit_line(s.cursor)
-            if hit:
-                hit['steps'] = 1
-                s.last_stop = hit
+            s.last_stop = s._hit_line(1)
     elif path == '/api/back':
         s.last_stop = None
         s.back()
@@ -1447,15 +1366,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split('?')[0]
-        if path.startswith('/api/'):
-            return self._handle_api(path, {})
         if path == '/':
             path = '/index.html'
         if path == '/d3.min.js':          # shared with the viz page
             full = os.path.join(UI_ROOT, 'js', 'd3.min.js')
         else:
             full = os.path.normpath(os.path.join(STATIC, path.lstrip('/')))
-            if not full.startswith(STATIC):
+            if not full.startswith(STATIC + os.sep):
                 return self._send(404, b'not found', 'text/plain')
         if not os.path.isfile(full):
             return self._send(404, b'not found', 'text/plain')
@@ -1472,11 +1389,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b'{}')
         except ValueError:
             return self._json({'error': 'bad JSON'}, 400)
-        self._handle_api(self.path, body)
-
-    def _handle_api(self, path, body):
         try:
-            res = api(path, body)
+            res = api(self.path.split('?')[0], body)
         except Exception as e:
             traceback.print_exc()
             return self._json({'error': 'internal error: %s: %s' %
