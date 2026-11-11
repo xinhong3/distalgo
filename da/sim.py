@@ -41,7 +41,9 @@ import da
 from . import common, pattern
 from .common import (builtin, internal, name_split_host, name_split_node,
                      ProcessId, get_runtime_option,
-                     ObjectDumper, ObjectLoader, TraceKind)
+                     ObjectDumper, ObjectLoader, TraceKind,
+                     TraceException, TraceMismatchException, TraceEndedException,
+                     TraceFormatException, TraceVersionException, TraceCorruptedException)
 from .transport import ChannelCaps, TransportManager, HEADER_SIZE, \
     TransportException, AuthenticationException
 
@@ -1280,13 +1282,6 @@ class RouterCommands(enum.Enum):
     ACK      = 4
     SENTINEL = 10
 
-class TraceException(BaseException): pass
-class TraceMismatchException(TraceException): pass
-class TraceEndedException(TraceException): pass
-class TraceFormatException(TraceException): pass
-class TraceVersionException(TraceException): pass
-class TraceCorruptedException(TraceException): pass
-
 TRACE_HEADER = b'DATR'
 TRACE_TYPE_RECV = 0x01
 TRACE_TYPE_SEND = 0x02
@@ -1401,10 +1396,10 @@ class Router(threading.Thread):
         if self.running:
             with self.lock:
                 if pid in self.local_procs:
-                    self.local_procs[pid].close()
-                    self.state_procs[pid].close()
-                    del self.local_procs[pid]
-                    del self.state_procs[pid]
+                    self.local_procs.pop(pid).close()
+                # replayed processes have no state queue
+                if pid in self.state_procs:
+                    self.state_procs.pop(pid).close()
         else:
             if pid in self.local_procs:
                 self.local_procs[pid].close()
@@ -1707,6 +1702,7 @@ class ProcessContainer:
         self.seqno = cmd_seqno
         self._trace_in_fd = None
         self._trace_out_fd = None
+        self._replay_files = None
         if len(process_name) > 0:
             self.name = process_name
         self.transport_manager = transport_manager
@@ -1734,7 +1730,6 @@ class ProcessContainer:
                              .format(tracename))
         sndname = tracename.replace('.trace', '.snd')
         tracename = filename
-        self._trace_in_fd = open(tracename, "rb")
         sndname = os.path.join(dirname, sndname)
         try:
             os.stat(sndname)
@@ -1743,6 +1738,16 @@ class ProcessContainer:
                 'Missing corresponding send trace file {!r} for {!r}!'
                 .format(sndname, tracename)
             ) from e
+        self._replay_files = (tracename, sndname)
+        self._open_replay()
+        # reopened in run(): open files can't be pickled under 'spawn'
+        self.cleanup()
+        self._dacls = self.dapid.pcls
+
+    def _open_replay(self):
+        """Opens the trace files and reads past their headers."""
+        tracename, sndname = self._replay_files
+        self._trace_in_fd = open(tracename, "rb")
         self._trace_out_fd = open(sndname, "rb")
         self.dapid, self.daparent \
             = process_trace_header(self._trace_in_fd, TRACE_TYPE_RECV)
@@ -1752,7 +1757,6 @@ class ProcessContainer:
                 "Process Id mismatch in {} and {}!"
                 .format(tracename, sndname)
             )
-        self._dacls = self.dapid.pcls
 
     def cleanup(self):
         # maybe just write directly to file, instead of maintaining list
@@ -1761,8 +1765,10 @@ class ProcessContainer:
         # print("finish")
         if self._trace_in_fd:
             self._trace_in_fd.close()
+            self._trace_in_fd = None
         if self._trace_out_fd:
             self._trace_out_fd.close()
+            self._trace_out_fd = None
 
     def init_router(self):
         if self.router is None:
@@ -1936,10 +1942,11 @@ class ProcessContainer:
                 hook()
 
             self.init_router()
-            if not self._trace_out_fd:
+            if self._replay_files is None:
                 forwarder = self.router.send
                 self.router.register_local_process(self.dapid, self.daparent)
             else:
+                self._open_replay()
                 forwarder = self.router.replay_send
                 self.router.replay_local_process(self.dapid,
                                                  self._trace_in_fd,

@@ -272,6 +272,9 @@ def entrypoint():
     trace_and_visualize = False
     visualize = module.Node_._config_object.get('visualize')
     visualize_config = {}
+    # replaying or dumping traces records nothing, so there is nothing to show
+    if get_runtime_option('replay_traces') or get_runtime_option('dump_trace'):
+        visualize = None
     if visualize:
         trace_and_visualize = True
 

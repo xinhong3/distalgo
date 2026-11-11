@@ -712,6 +712,14 @@ class BufferIOWrapper:
         self.fptr = end
 
 class QueueEmpty(Exception): pass
+
+class TraceException(BaseException): pass
+class TraceMismatchException(TraceException): pass
+class TraceEndedException(TraceException): pass
+class TraceFormatException(TraceException): pass
+class TraceVersionException(TraceException): pass
+class TraceCorruptedException(TraceException): pass
+
 class WaitableQueue:
     """This class implements a fast waitable queue based on a `deque`.
 
@@ -1001,7 +1009,7 @@ class ReplayQueue:
             delay, item = self._in_loader.load()
             if delay:
                 time.sleep(delay)
-            if isinstance(item, common.QueueEmpty):
+            if isinstance(item, QueueEmpty):
                 raise item
             else:
                 return item
