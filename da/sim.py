@@ -103,11 +103,11 @@ def _program_frames(frame):
             yield frame, fn
         frame = frame.f_back
 
-def _encode_locals(frame):
+def _encode_locals(frame, encode):
     """Returns the local variables of `frame`, encoded, without `self`, names
     starting with '_', callables, and modules.
     """
-    return {k: common.encode_value(v, maxdepth=4)
+    return {k: encode(v, maxdepth=4)
             for k, v in frame.f_locals.items()
             if not k.startswith('_') and k != 'self' and
             not callable(v) and not isinstance(v, type(sys))}
@@ -221,7 +221,8 @@ class DistProcess():
 
         # Event log for replay: only when the router records traces.
         rec = self.__stateq
-        self.__rec = rec if getattr(rec, 'records_events', False) else None
+        self.__rec = rec if getattr(rec, 'records_events', False) else None ## recorder. todo: name is confusing
+        self.__encode = rec._events_dumper.encode if self.__rec else None
         self.__recseq = itertools.count()
         self.__recfields = {}      # field -> encoded value last recorded
         # main()'s code, whose variables are recorded (main() has no _state)
@@ -252,15 +253,16 @@ class DistProcess():
                 frames.append({'file': filename, 'line': frame.f_lineno,
                                'func': frame.f_code.co_name})
                 if frame.f_code is self.__main_code:
-                    data['locals'] = _encode_locals(frame)
+                    data['locals'] = _encode_locals(frame, self.__encode)
             data['frames'] = frames
         if why:
             data['cause'] = self.__cause or {'type': 'run',
                                              'after': self.__step_cause}
         if state:
             changed = {}
+            # todo: every field is encoded to find the changed ones
             for k, v in self._state.__dict__.items():
-                enc = common.encode_value(v)
+                enc = self.__encode(v)
                 if self.__recfields.get(k, changed) != enc:
                     changed[k] = self.__recfields[k] = enc
             data['state'] = changed
@@ -277,6 +279,8 @@ class DistProcess():
         self._clock = newclk
 
         # ignore Node or root process
+        # todo: only when recording, and JsonDumper.encode in place of
+        # deepcopy: this copies the state at every clock change of every run
         try:
             if hasattr(self, '_state'):
                 self.__stateq.append({
@@ -504,7 +508,7 @@ class DistProcess():
         if self._recording:
             self._record(TraceKind.SetupCall, where=True, why=True,
                          procs=[_pid_str(p) for p in _targets(procs)],
-                         args=common.encode_value(list(args)))
+                         args=self.__encode(list(args)))
         if seqno is None:
             seqno = self._create_cmd_seqno()
         self._register_async_event(msgtype=Command.SetupAck, seqno=seqno)
@@ -692,7 +696,7 @@ class DistProcess():
             self._record(TraceKind.Send, where=True, why=True,
                          sclk=self._logical_clock,
                          to=[_pid_str(d) for d in _targets(to)],
-                         payload=common.encode_value(message))
+                         payload=self.__encode(message))
         self.__trigger_event(pattern.SentEvent(
             (self._logical_clock, to, self._id), message))
         return res
@@ -902,8 +906,7 @@ class DistProcess():
                         'file': code and _program_file(code),
                         'line': code and code.co_firstlineno,
                         'label': label, 'msg': msg,
-                        'bindings': {k: common.encode_value(v, maxdepth=3,
-                                                            maxitems=20)
+                        'bindings': {k: self.__encode(v, maxdepth=3, maxitems=20)
                                      for k, v in args.items()}}
                 try:
                     handler(**args)
@@ -1086,7 +1089,7 @@ class DistProcess():
                     self._record(TraceKind.Setup, state=True, parent=_pid_str(src),
                                  cls=type(self).__name__,
                                  file=_source_file(type(self)),
-                                 args=common.encode_value(list(realargs)))
+                                 args=self.__encode(list(realargs)))
             except Exception as e:
                 self._log.error("Exception during setup(%r): %r", args, e)
                 self._log.debug("%r", e, exc_info=1)

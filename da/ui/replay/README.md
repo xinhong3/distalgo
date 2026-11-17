@@ -64,7 +64,7 @@ blocks, and when it ends (so a change is put down to the handler, or else to
 `run()`); the payload of a message is recorded once,
 at its send.  `main()`'s events also carry its local variables, which
 conditions can refer to.  Values are encoded keeping tuples, sets, dicts and process ids
-(`da.common.encode_value`), so conditions can be evaluated on them.
+(`da.common.JsonDumper.encode`), so conditions can be evaluated on them.
 
 ## How a run becomes steps
 
@@ -84,11 +84,14 @@ recorded event: a send, output, `await`, `new`/`setup`/`start`, or the
 ## Where the code comes from
 
 * `da/sim.py`, `da/common.py`: the recording, built on viz-states' per-process
-  `StateQueue` (generalized to also write the event log).
+  `StateQueue` (generalized to also write the event log).  Values are
+  serialized by `JsonDumper` and read back by `JsonLoader` (`da/common.py`,
+  next to the pickle `ObjectDumper`/`ObjectLoader`); the value formatting
+  (`fmt`) is taken from DistAlgo Live (`livesim.py`).
 * `da/replay.py`: reading the logs, ordering, explanations, conditions, and
-  the HTTP server.  The value formatting, the code-around-a-line index and
-  condition compiling are taken from DistAlgo Live (`livesim.py`), the server
-  and its API from DistAlgo Live's `server.py`.
+  the HTTP server.  The code-around-a-line index and condition compiling are
+  taken from DistAlgo Live (`livesim.py`), the server and its API from
+  DistAlgo Live's `server.py`.
 * `da/ui/replay/`: DistAlgo Live's page (`app.js`, `style.css`, `index.html`),
   with editing and running removed and loading a trace added; `d3.min.js` is
   the viz page's `da/ui/js/d3.min.js`.

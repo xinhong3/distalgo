@@ -34,6 +34,7 @@ import logging
 import warnings
 import threading
 import copy
+import types
 
 from datetime import datetime
 from collections import abc, deque, namedtuple
@@ -804,13 +805,17 @@ class WaitableQueue:
     def __len__(self):
         return self._q.__len__()
 
-_encoded_pids = {}             # ProcessId -> its encoding (computed once)
+#########################
+# JSON serialization
 
-def encode_value(value, depth=0, maxdepth=8, maxitems=500):
-    """Encodes `value` as JSON-compatible data, keeping the Python types that
-    DistAlgo programs use (tuples, sets, dicts with any keys, process ids), so
-    that a recorded value can be turned back into an equivalent Python value
-    later (see `da.replay.decode_value`).
+class JsonDumper:
+    """Serializes Python values as JSON, like `ObjectDumper` does as pickle,
+    but readable without the program's classes and bounded in size.
+
+    `encode` turns a value into JSON-compatible data, keeping the Python types
+    that DistAlgo programs use (tuples, sets, dicts with any keys, process
+    ids), so that `JsonLoader.decode` can turn it back into an equivalent
+    value.  `dump` writes such data to `file` as one line.
 
     Tagged forms: {"$pid": id, "cls": name, "short": "<Cls:xxxxx>"},
     {"$tuple": [...]}, {"$set": [...]}, {"$dict": [[k, v], ...]},
@@ -818,65 +823,217 @@ def encode_value(value, depth=0, maxdepth=8, maxitems=500):
     and {"$more": n} for items left out of a very large container.
 
     """
-    if value is None or isinstance(value, (bool, int, str)):
-        return value
-    if isinstance(value, float):
-        return value if value == value and value not in (float('inf'),
-                                                         float('-inf')) \
-            else {"$repr": repr(value)}
-    if isinstance(value, ProcessId):
-        enc = _encoded_pids.get(value)
-        if enc is None:
-            enc = _encoded_pids[value] = {
-                "$pid": value._filename_form_(),
-                "cls": value.pcls.__name__, "short": value._short_form_()}
-        return enc
-    if depth >= maxdepth:
+
+    def __init__(self, file=None, maxdepth=8, maxitems=500):
+        self.file = file
+        self.maxdepth = maxdepth
+        self.maxitems = maxitems
+        self._pids = {}         # ProcessId -> its encoding (computed once)
+
+    def encode(self, value, depth=0, maxdepth=None, maxitems=None):
+        if maxdepth is None:
+            maxdepth = self.maxdepth
+        if maxitems is None:
+            maxitems = self.maxitems
+        if value is None or isinstance(value, (bool, int, str)):
+            return value
+        if isinstance(value, float):
+            return value if value == value and value not in (float('inf'),
+                                                             float('-inf')) \
+                else {"$repr": repr(value)}
+        if isinstance(value, ProcessId):
+            enc = self._pids.get(value)
+            if enc is None:
+                enc = self._pids[value] = {
+                    "$pid": value._filename_form_(),
+                    "cls": value.pcls.__name__, "short": value._short_form_()}
+            return enc
+        if depth >= maxdepth:
+            return {"$repr": _short_repr(value)}
+
+        def items(seq):
+            out = []
+            for i, x in enumerate(seq):
+                if i >= maxitems:
+                    out.append({"$more": len(seq) - maxitems})
+                    break
+                out.append(self.encode(x, depth + 1, maxdepth, maxitems))
+            return out
+
+        if isinstance(value, tuple):
+            return {"$tuple": items(value)}
+        if isinstance(value, list):
+            return items(value)
+        if isinstance(value, (set, frozenset)):
+            try:
+                elems = sorted(value, key=repr)
+            except Exception:
+                elems = list(value)
+            return {"$set": items(elems)}
+        if isinstance(value, dict):
+            pairs = []
+            for i, (k, v) in enumerate(value.items()):
+                if i >= maxitems:
+                    pairs.append({"$more": len(value) - maxitems})
+                    break
+                pairs.append([self.encode(k, depth + 1, maxdepth, maxitems),
+                              self.encode(v, depth + 1, maxdepth, maxitems)])
+            return {"$dict": pairs}
+        if isinstance(value, bytes):
+            return {"$repr": _short_repr(value)}
+        if isinstance(value, type):
+            return {"$repr": value.__name__}
+        fields = getattr(value, '__dict__', None)
+        if isinstance(fields, dict) and type(value).__repr__ is object.__repr__:
+            return {"$obj": type(value).__name__,
+                    "fields": {k: self.encode(v, depth + 1, maxdepth, maxitems)
+                               for k, v in fields.items()
+                               if not k.startswith('_')}}
         return {"$repr": _short_repr(value)}
 
-    def items(seq):
-        out = []
-        for i, x in enumerate(seq):
-            if i >= maxitems:
-                out.append({"$more": len(seq) - maxitems})
-                break
-            out.append(encode_value(x, depth + 1, maxdepth, maxitems))
-        return out
+    def dump(self, data):
+        self.file.write(json.dumps(data, default=_short_repr) + '\n')
+        self.file.flush()
 
-    if isinstance(value, tuple):
-        return {"$tuple": items(value)}
-    if isinstance(value, list):
-        return items(value)
-    if isinstance(value, (set, frozenset)):
-        try:
-            elems = sorted(value, key=repr)
-        except Exception:
-            elems = list(value)
-        return {"$set": items(elems)}
-    if isinstance(value, dict):
-        pairs = []
-        for i, (k, v) in enumerate(value.items()):
-            if i >= maxitems:
-                pairs.append({"$more": len(value) - maxitems})
-                break
-            pairs.append([encode_value(k, depth + 1, maxdepth, maxitems),
-                          encode_value(v, depth + 1, maxdepth, maxitems)])
-        return {"$dict": pairs}
-    if isinstance(value, bytes):
-        return {"$repr": _short_repr(value)}
-    if isinstance(value, type):
-        return {"$repr": value.__name__}
-    fields = getattr(value, '__dict__', None)
-    if isinstance(fields, dict) and type(value).__repr__ is object.__repr__:
-        return {"$obj": type(value).__name__,
-                "fields": {k: encode_value(v, depth + 1, maxdepth, maxitems)
-                           for k, v in fields.items()
-                           if not k.startswith('_')}}
-    return {"$repr": _short_repr(value)}
+class ReplayPid:
+    """A recorded process id: compares and hashes like the original one."""
+    # todo: order by uid like ProcessId; keys order 'P:10' before 'P:2'
+    # todo: equal to the ProcView of the same process (see replay.py)
+
+    __slots__ = ('id', 'key', 'cls', 'short')
+
+    def __init__(self, id, key, cls, short):
+        self.id, self.key, self.cls, self.short = id, key, cls, short
+
+    def __repr__(self):
+        return '<%s>' % self.key
+
+    def __eq__(self, other):
+        return isinstance(other, ReplayPid) and other.id == self.id
+
+    def __lt__(self, other):
+        if not isinstance(other, ReplayPid):
+            return NotImplemented
+        return self.key < other.key
+
+    def __hash__(self):
+        return hash(self.id)
+
+class ReplayObj(types.SimpleNamespace):
+    """A recorded object that has fields."""
+
+    def __init__(self, typename, fields):
+        super().__init__(**fields)
+        self.__dict__['_typename'] = typename
+
+    def __repr__(self):
+        return '%s(%s)' % (self._typename, ', '.join(
+            '%s=%s' % (k, fmt(v)) for k, v in self.__dict__.items()
+            if not k.startswith('_')))
+
+    __hash__ = object.__hash__
+
+class ReplayRepr(str):
+    """A recorded value that was only kept as its repr()."""
+
+    def __repr__(self):
+        return str.__str__(self)
+
+class JsonLoader:
+    """Reads what `JsonDumper` wrote: `load` reads one line of data from
+    `file`, `decode` is the inverse of `JsonDumper.encode`.
+
+    A decoded value has `ReplayPid`s for process ids (`pids` maps recorded
+    process ids to them), `ReplayObj`s for objects and `ReplayRepr`s for what
+    was only kept as its repr().
+
+    """
+
+    def __init__(self, file=None, pids=None):
+        self.file = file
+        self.pids = {} if pids is None else pids
+
+    def load(self):
+        line = self.file.readline()
+        if not line:
+            raise EOFError
+        return json.loads(line)
+
+    def decode(self, v):
+        def items(xs):
+            # todo: items left out ('$more') are dropped silently, so a
+            # condition on a very large container sees only part of it
+            return [self.decode(x) for x in xs
+                    if not (isinstance(x, dict) and '$more' in x)]
+
+        if isinstance(v, list):
+            return items(v)
+        if not isinstance(v, dict):
+            return v
+        if '$pid' in v:
+            p = self.pids.get(v['$pid'])
+            if p is None:
+                p = ReplayPid(v['$pid'], v.get('short', v['$pid']).strip('<>'),
+                              v.get('cls', '?'), v.get('short', v['$pid']))
+                self.pids[v['$pid']] = p
+            return p
+        if '$tuple' in v:
+            return tuple(items(v['$tuple']))
+        if '$set' in v:
+            xs = items(v['$set'])
+            try:
+                return set(xs)
+            except TypeError:
+                return xs
+        if '$dict' in v:
+            out = {}
+            for k, x in items(v['$dict']):
+                try:
+                    out[k] = x
+                except TypeError:
+                    out[ReplayRepr(fmt(k))] = x
+            return out
+        if '$obj' in v:
+            return ReplayObj(v['$obj'], {k: self.decode(x)
+                                         for k, x in v.get('fields', {}).items()})
+        if '$repr' in v:
+            return ReplayRepr(v['$repr'])
+        return v
 
 def _short_repr(value, limit=200):
     try:
         s = repr(value)
+    except Exception as e:
+        s = '<unprintable %s>' % type(e).__name__
+    return s if len(s) <= limit else s[:limit - 1] + '…'
+
+def _pretty(v, depth=0):
+    """repr() that is readable and stable: sets are sorted, process ids are
+    short (from DistAlgo Live)."""
+    if depth > 6:
+        return '…'
+    if isinstance(v, (str, bytes, int, float, bool, type(None), ReplayPid,
+                      ReplayObj)):
+        return repr(v)
+    if isinstance(v, tuple):
+        inner = ', '.join(_pretty(x, depth + 1) for x in v)
+        return '(%s,)' % inner if len(v) == 1 else '(%s)' % inner
+    if isinstance(v, list):
+        return '[%s]' % ', '.join(_pretty(x, depth + 1) for x in v)
+    if isinstance(v, (set, frozenset)):
+        if not v:
+            return 'set()'
+        return '{%s}' % ', '.join(sorted(_pretty(x, depth + 1) for x in v))
+    if isinstance(v, dict):
+        return '{%s}' % ', '.join(
+            '%s: %s' % (_pretty(k, depth + 1), _pretty(x, depth + 1))
+            for k, x in v.items())
+    return repr(v)
+
+# todo: same as _short_repr, with _pretty for repr
+def fmt(v, limit=200):
+    try:
+        s = _pretty(v)
     except Exception as e:
         s = '<unprintable %s>' % type(e).__name__
     return s if len(s) <= limit else s[:limit - 1] + '…'
@@ -921,6 +1078,7 @@ class StateQueue:
         self._in_file = in_stream
         self._states = []
         self._events_file = events_stream
+        self._events_dumper = JsonDumper(events_stream)
         self._events_lock = threading.Lock()
 
     @property
@@ -929,26 +1087,29 @@ class StateQueue:
 
     def event(self, record):
         """Appends one event (a dict of JSON-compatible data) to the log."""
-        if self._events_file is None:
-            return
-        try:
-            line = json.dumps(record, default=_short_repr)
-        except Exception as e:
-            line = json.dumps({'kind': TraceKind.Error, 'pid': record.get('pid'),
-                               'text': 'unrecordable event: %r' % e})
         with self._events_lock:
-            if self._events_file is not None:
-                self._events_file.write(line + '\n')
-                self._events_file.flush()
+            if self._events_file is None:
+                return
+            try:
+                self._events_dumper.dump(record)
+            except Exception as e:
+                # todo: keep seq and t, else replay sorts this event first
+                self._events_dumper.dump({
+                    'kind': TraceKind.Error, 'pid': record.get('pid'),
+                    'text': 'unrecordable event: %r' % e})
 
     #
     # Custom serialization for objects inheriting from builtin types
     # https://stackoverflow.com/a/17798594/1173425
     #
+    # todo: use JsonDumper.encode (with pids as str, no tags) in place of
+    # custom_json_handler, debug and to_json: they do the same thing
     def custom_json_handler(self,obj):
+        # todo: frozenset, deque and other unknown types become null
         if not hasattr(obj, 'originalObject'):
             return None
         obj = obj.originalObject
+        # todo: 0, False and '' are written as "null"
         if not obj:
             return "null"
         if isinstance(obj, ProcessId):
@@ -969,6 +1130,8 @@ class StateQueue:
         elif obj.__class__ == tuple:
             return [self.debug(item) for item in obj]
         elif obj.__class__ == dict:
+            # todo: a tuple or pid key makes to_json raise, and close() then
+            # writes no state at all; an int key becomes a str
             return dict((key,self.debug(obj[key])) for key in obj)
         elif hasattr(obj, '__dict__'):
             return dict((key,self.debug(obj.__dict__[key])) for key in obj.__dict__)

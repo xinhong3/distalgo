@@ -434,7 +434,7 @@ def entrypoint():
         from . import replay
         replay_data = run_name + '.replay.json'
         try:
-            replay.save(replay.collect(get_runtime_option('logdir')),
+            replay.save(replay.load(get_runtime_option('logdir')),
                         replay_data)
             print('Replay data: {}\nReplay: python -m da.replay {}'.format(
                 replay_data, replay_data))
