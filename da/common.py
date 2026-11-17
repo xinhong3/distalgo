@@ -817,7 +817,7 @@ class JsonDumper:
     ids), so that `JsonLoader.decode` can turn it back into an equivalent
     value.  `dump` writes such data to `file` as one line.
 
-    Tagged forms: {"$pid": id, "cls": name, "short": "<Cls:xxxxx>"},
+    Tagged forms: {"$pid": [class name, uid, name, nodename]},
     {"$tuple": [...]}, {"$set": [...]}, {"$dict": [[k, v], ...]},
     {"$obj": type name, "fields": {...}}, {"$repr": "..."} for anything else,
     and {"$more": n} for items left out of a very large container.
@@ -844,9 +844,8 @@ class JsonDumper:
         if isinstance(value, ProcessId):
             enc = self._pids.get(value)
             if enc is None:
-                enc = self._pids[value] = {
-                    "$pid": value._filename_form_(),
-                    "cls": value.pcls.__name__, "short": value._short_form_()}
+                enc = self._pids[value] = {"$pid": [
+                    value.pcls.__name__, value.uid, value.name, value.nodename]}
             return enc
         if depth >= maxdepth:
             return {"$repr": _short_repr(value)}
@@ -895,30 +894,6 @@ class JsonDumper:
         self.file.write(json.dumps(data, default=_short_repr) + '\n')
         self.file.flush()
 
-class ReplayPid:
-    """A recorded process id: compares and hashes like the original one."""
-    # todo: order by uid like ProcessId; keys order 'P:10' before 'P:2'
-    # todo: equal to the ProcView of the same process (see replay.py)
-
-    __slots__ = ('id', 'key', 'cls', 'short')
-
-    def __init__(self, id, key, cls, short):
-        self.id, self.key, self.cls, self.short = id, key, cls, short
-
-    def __repr__(self):
-        return '<%s>' % self.key
-
-    def __eq__(self, other):
-        return isinstance(other, ReplayPid) and other.id == self.id
-
-    def __lt__(self, other):
-        if not isinstance(other, ReplayPid):
-            return NotImplemented
-        return self.key < other.key
-
-    def __hash__(self):
-        return hash(self.id)
-
 class ReplayObj(types.SimpleNamespace):
     """A recorded object that has fields."""
 
@@ -943,15 +918,15 @@ class JsonLoader:
     """Reads what `JsonDumper` wrote: `load` reads one line of data from
     `file`, `decode` is the inverse of `JsonDumper.encode`.
 
-    A decoded value has `ReplayPid`s for process ids (`pids` maps recorded
-    process ids to them), `ReplayObj`s for objects and `ReplayRepr`s for what
-    was only kept as its repr().
+    A decoded value has `ProcessId`s for process ids (without addresses, and
+    with a stand-in class of the same name), `ReplayObj`s for objects and
+    `ReplayRepr`s for what was only kept as its repr().
 
     """
 
-    def __init__(self, file=None, pids=None):
+    def __init__(self, file=None):
         self.file = file
-        self.pids = {} if pids is None else pids
+        self._classes = {}      # class name -> its stand-in
 
     def load(self):
         line = self.file.readline()
@@ -971,12 +946,10 @@ class JsonLoader:
         if not isinstance(v, dict):
             return v
         if '$pid' in v:
-            p = self.pids.get(v['$pid'])
-            if p is None:
-                p = ReplayPid(v['$pid'], v.get('short', v['$pid']).strip('<>'),
-                              v.get('cls', '?'), v.get('short', v['$pid']))
-                self.pids[v['$pid']] = p
-            return p
+            cls, uid, name, nodename = v['$pid']
+            if cls not in self._classes:
+                self._classes[cls] = type(cls, (), {})
+            return ProcessId(uid, 1, self._classes[cls], name, nodename, '', ())
         if '$tuple' in v:
             return tuple(items(v['$tuple']))
         if '$set' in v:
@@ -1012,7 +985,7 @@ def _pretty(v, depth=0):
     short (from DistAlgo Live)."""
     if depth > 6:
         return '…'
-    if isinstance(v, (str, bytes, int, float, bool, type(None), ReplayPid,
+    if isinstance(v, (str, bytes, int, float, bool, type(None), ProcessId,
                       ReplayObj)):
         return repr(v)
     if isinstance(v, tuple):
@@ -1049,9 +1022,9 @@ class TraceKind(str, enum.Enum):
         - 'state': the `_state` fields changed since they were last recorded
 
     """                     # when | what
-    Run       = 'run'       # before run() starts, after `start` | class, parent, file; state
+    Run       = 'run'       # before run() starts, after `start` | id, class, parent, file; state
     End       = 'end'       # after run() returns, exits or crashes | status, error; state
-    Setup     = 'setup'     # in the new process, after setup() returns | parent, class, file, args; state
+    Setup     = 'setup'     # in the new process, after setup() returns | id, parent, class, file, args; state
     SetupCall = 'setupcall' # in the caller, when setup() is called | procs, args; frames, cause
     StartCall = 'startcall' # in the caller, when start() is called | procs; frames, cause
     New       = 'new'       # in the caller, after new() creates the processes | class, file, children; frames, cause

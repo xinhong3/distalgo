@@ -46,7 +46,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import da
 from da.compiler import ui as daui
 from da.compiler import utils as dautils
-from da.common import JsonLoader, ReplayPid, fmt
+from da.common import JsonLoader, ProcessId, TraceKind, fmt
 
 UI_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ui')   # da/ui, next to the viz page
 STATIC = os.path.join(UI_ROOT, 'replay')
@@ -230,16 +230,10 @@ def _read_source(fn):
 
 def _source_files(processes):
     """The program's source files that the events refer to."""
-    files = set()
-    for evs in processes.values():
-        for e in evs:
-            for fr in e.get('frames') or ():
-                files.add(fr['file'])
-            c = e.get('cause') or {}
-            if c.get('file'):
-                files.add(c['file'])
-            if e.get('file'):
-                files.add(e['file'])
+    events = [e for evs in processes.values() for e in evs]
+    files = {fr['file'] for e in events for fr in e.get('frames') or ()}
+    files |= {(e.get('cause') or {}).get('file') for e in events}
+    files |= {e.get('file') for e in events}
     return {f for f in files if f}
 
 def load(path):
@@ -272,18 +266,12 @@ def load(path):
                     pass           # a line cut off when the run stopped
         if evs:
             processes[evs[0]['pid']] = evs
-    program = next((e.get('file') for evs in processes.values() for e in evs
-                    if e['kind'] == 'run' and e.get('main')), None)
     sources = {}
     for fn in _source_files(processes):
         text = _read_source(fn)
         if text is not None:
             sources[fn] = text
     return {'format': DATA_FORMAT, 'version': 1,
-            'program': program,
-            'logdir': os.path.abspath(path),
-            'recorded': min((evs[0].get('t', 0) for evs in processes.values()),
-                            default=None),
             'sources': sources,
             'processes': processes}
 
@@ -292,26 +280,20 @@ def save(data, path):
         json.dump(data, f, separators=(',', ':'))
     return path
 
-# --------------------------------------------------------------------------
-# The recorded run
-# --------------------------------------------------------------------------
 
+# Representation of a recorded process, with events ordered
 class Proc:
-    """One recorded process: its events, and what they say about it."""
-
-    def __init__(self, id, events):
-        self.id = id
+    def __init__(self, events, decode):
         self.events = events = sorted(events, key=lambda e: e.get('seq', 0))
-        self.cls = next((e['cls'] for e in events if e.get('cls') and
-                         e['kind'] in ('run', 'setup')), id.split('-')[0])
-        self.is_main = any(e['kind'] == 'run' and e.get('main') for e in events)
-        self.file = next((e.get('file') for e in events if e.get('file') and
-                          e['kind'] in ('run', 'setup')), None)
-        self.key = None           # 'Cls:1', or 'main'
-        self.pid = None           # ReplayPid
-        self.segments = []        # [[event, ...]] each one a step
-        self.pre = []             # events before the first step (setup)
-        self.t0 = events[0].get('t', 0)
+        for e in events:            # kinds as TraceKind, also as dict keys
+            e['kind'] = TraceKind(e['kind'])
+        start = next(e for e in events if e['kind'] in (TraceKind.Run, TraceKind.Setup))
+        self.pid = decode(start['id'])   # its ProcessId, as the program's values hold it
+        self.is_main = bool(start.get('main'))
+
+    @property
+    def cls(self):
+        return MAIN if self.is_main else self.pid.pcls.__name__
 
 
 class Message:
@@ -319,7 +301,8 @@ class Message:
 
     def __init__(self, key, src, dst, sclk, value):
         self.key, self.src, self.dst, self.sclk, self.value = key, src, dst, sclk, value
-        self.send_ev = self.send_step = self.recv_ev = self.recv_step = None
+        self.send_seg = self.recv_seg = None      # index of the segment
+        self.send_step = self.recv_step = None
 
 
 class Trace:
@@ -327,98 +310,114 @@ class Trace:
     steps."""
 
     def __init__(self, data):
-        self.procs = {pid: Proc(pid, evs)
-                      for pid, evs in data['processes'].items() if evs}
+        self.decode = JsonLoader().decode
+        # recorded id, as the events name a process (pid._filename_form_()) -> Proc
+        self.procs = {id: Proc(evs, self.decode)
+                      for id, evs in data['processes'].items() if evs}
         if not self.procs:
             raise ValueError('the recorded run has no events')
-        self._name_processes()
-        self.decode = JsonLoader(pids=self.pids).decode
-        self._segment()
-        self._order()
-        self._messages()
+        self.steps = []           # [{'id', 'kind', 'events'}] in causal order
+        self.times = []           # step -> recorded time since the first step
+        self.messages = set()     # set of msgs, one per send and destination
+        self.recv_msg = {}        # (pid, seq) of a recv -> Message
+        self.sent_msgs = collections.defaultdict(list)  # (pid, seq) of a send -> [Message]
+        segs = self._segment()
+        self._pair(segs)
+        self._order(segs)
         procs = self.procs.values()
-        self.main_file = data.get('program') or next(
-            (p.file for p in procs if p.is_main), None)
+        self.main_file = next((p.events[0].get('file') for p in procs if p.is_main), None)
         files = sorted(_source_files(data['processes']),
                        key=lambda f: (f != self.main_file, f))
         self.src = SourceMap(files, data.get('sources') or {})
         self.classes = sorted({p.cls for p in procs if not p.is_main})
 
-    # ---- naming: Cls:1, Cls:2, ... in creation order; main() is 'main'
-    def _name_processes(self):
-        procs = self.procs.values()
-        created = {}              # process -> (when, how many before it)
-        for p in sorted(procs, key=lambda p: p.t0):
-            for e in p.events:
-                if e['kind'] == 'new':
-                    for c in e.get('children', []):
-                        created.setdefault(c, (e['t'], len(created)))
-        counts = collections.Counter()
-        self.pids = {}            # recorded process id -> ReplayPid
-        for p in sorted(procs, key=lambda p: created.get(p.id, (p.t0, 1 << 30))):
-            if p.is_main:
-                p.key = p.cls = MAIN
-            else:
-                counts[p.cls] += 1
-                p.key = '%s:%d' % (p.cls, counts[p.cls])
-            # DistAlgo's short form: <Cls:last 5 hex digits of the uid>
-            name, _, uid = p.id.partition('-')
-            p.pid = self.pids[p.id] = ReplayPid(
-                p.id, p.key, p.cls, '<%s:%s>' % (name, uid.split('.')[0][-5:]))
+    def pid(self, id):
+        """The ProcessId of a recorded id (the id itself if not recorded)."""
+        p = self.procs.get(id)
+        return p.pid if p else id
 
-    def key(self, pid):
-        p = self.procs.get(pid)
-        return p.key if p else str(pid)
+    def name(self, id):
+        """The name shown for a process: DistAlgo's short form, e.g. Pong:60402, or main."""
+        p = self.procs.get(id)
+        return id if p is None else MAIN if p.is_main else p.pid._short_form_()[1:-1]
 
-    # ---- steps: one per run / recv / timeout
+    # ---- segments: activations of a process (its setup(), run, a delivered
+    # message, a timeout), each with what the process did until the next one
     def _segment(self):
-        for p in self.procs.values():
-            for e in p.events:
-                if e['kind'] in ('run', 'recv', 'timeout'):
-                    p.segments.append([e])
-                elif p.segments:
-                    p.segments[-1].append(e)
+        """[{'id', 'kind', 'events'}], each process' segments in its own order."""
+        segs = []
+        for id, p in self.procs.items():
+            for i, e in enumerate(p.events):
+                if e['kind'] in (TraceKind.Run, TraceKind.Recv, TraceKind.Timeout):
+                    segs.append({'id': id, 'kind': e['kind'], 'events': [e]})
+                elif i == 0:        # the events before run: setup()
+                    segs.append({'id': id, 'kind': TraceKind.Setup, 'events': [e]})
                 else:
-                    p.pre.append(e)
+                    segs[-1]['events'].append(e)
+        return segs
 
-    def _order(self):
-        """Topological order of all segments: each process' own order,
-        send before receive, start() before the started process runs;
-        otherwise by recorded time."""
-        procs = self.procs.values()
-        sends = collections.defaultdict(list)    # (src, dst, sclk) -> segment
-        starts = {}                              # child -> segment
-        for p in procs:
-            for i, seg in enumerate(p.segments):
-                for e in seg:
-                    if e['kind'] == 'send':
-                        for d in e.get('to', []):
-                            sends[(p.id, d, e.get('sclk'))].append((p.id, i))
-                    elif e['kind'] == 'startcall':
-                        for c in e.get('procs', []):
-                            starts.setdefault(c, (p.id, i))
-        deps = {}             # (pid, segment index) -> segments it follows
-        for p in procs:
-            for i, seg in enumerate(p.segments):
-                me = (p.id, i)
-                deps[me] = {(p.id, i - 1)} if i > 0 else set()
-                head = seg[0]
-                if head['kind'] == 'recv':
-                    cands = sends.get((head['src'], p.id, head.get('sclk')))
-                    if cands:
-                        deps[me].add(cands[0])
-                if head['kind'] == 'run' and p.id in starts:
-                    deps[me].add(starts[p.id])
-                deps[me].discard(me)
+    @staticmethod
+    def _seg_events(segs, *kinds):
+        """(segment index, event) of every event of one of `kinds`."""
+        return [(i, e) for i, seg in enumerate(segs) for e in seg['events'] if e['kind'] in kinds]
+
+    def _pair(self, segs):
+        """Pairs every send with its receive, from each process' own events:
+        a receive gets the first unpaired send on its channel with the same
+        sender's clock (so in order on the channel, without clocks)."""
+        chans = collections.defaultdict(list)    # (src, dst) -> [Message] in send order
+
+        def new(src, dst, e):
+            chan = chans[(src, dst)]
+            m = Message('%s>%s#%d' % (self.name(src), self.name(dst), len(chan) + 1),
+                        src, dst, e.get('sclk'), self.decode(e.get('payload')))
+            chan.append(m)
+            self.messages.add(m)
+            return m
+
+        for i, e in self._seg_events(segs, TraceKind.Send):
+            src = segs[i]['id']
+            for dst in e['to']:
+                m = new(src, dst, e)
+                m.send_seg = i
+                self.sent_msgs[(src, e['seq'])].append(m)
+        for i, e in self._seg_events(segs, TraceKind.Recv):
+            dst = segs[i]['id']
+            m = next((m for m in chans[(e['src'], dst)]
+                      if m.recv_seg is None and m.sclk == e.get('sclk')), None)
+            if m is None:          # sender not recorded: make one up
+                m = new(e['src'], dst, e)
+            m.recv_seg = i
+            self.recv_msg[(dst, e['seq'])] = m
+
+    def _order(self, segs):
+        """Topological order of the segments into steps: a segment follows the
+        process' previous one and what triggered it in another process
+        (setup() -> setup, start() -> run, send -> receive); otherwise by
+        recorded time."""
+        # segment -> segments it follows: the process' previous one,
+        deps = {i: {i - 1} if i > 0 and segs[i - 1]['id'] == seg['id'] else set()
+                for i, seg in enumerate(segs)}
+        # the setup() or start() call that triggers it,
+        triggers = {TraceKind.SetupCall: TraceKind.Setup, TraceKind.StartCall: TraceKind.Run}
+        at = {(segs[i]['id'], e['kind']): i for i, e in self._seg_events(segs, *triggers.values())}
+        for i, e in self._seg_events(segs, *triggers):
+            for c in e['procs']:
+                j = at.get((c, triggers[e['kind']]))
+                if j is not None:
+                    deps[j].add(i)
+        # and the send of a message, for its receive
+        for m in self.messages:
+            if None not in (m.send_seg, m.recv_seg) and m.send_seg != m.recv_seg:
+                deps[m.recv_seg].add(m.send_seg)
         users = collections.defaultdict(set)
         for s, ds in deps.items():
             for d in ds:
                 users[d].add(s)
         indeg = {s: len(ds) for s, ds in deps.items()}
 
-        def prio(s):
-            p = self.procs[s[0]]
-            return (p.segments[s[1]][0].get('t', 0), p.key, s[1])
+        def prio(i):
+            return (segs[i]['events'][0].get('t', 0), self.name(segs[i]['id']), i)
         heap = [(prio(s), s) for s in deps if indeg[s] == 0]
         heapq.heapify(heap)
         order = []
@@ -432,64 +431,14 @@ class Trace:
         if len(order) < len(deps):       # inconsistent trace: keep the rest
             done = set(order)
             order += sorted((s for s in deps if s not in done), key=prio)
-        self.steps = [{'pid': pid, 'events': self.procs[pid].segments[i]}
-                      for pid, i in order]
+        self.steps += [segs[i] for i in order]
         ts = [st['events'][0].get('t', 0) for st in self.steps]
         t0 = min(ts, default=0)
         # monotone step times (the order can put a later-recorded step first)
-        self.times = [t - t0 for t in itertools.accumulate(ts, max)]
-
-    def _messages(self):
-        """Pair every send with its receive."""
-        self.messages = []
-        chan_count = collections.Counter()
-        unmatched = collections.defaultdict(collections.deque)  # (src, dst)
-        by_clock = {}
-
-        def new(src, dst, e):
-            chan = (self.key(src), self.key(dst))
-            chan_count[chan] += 1
-            m = Message('%s>%s#%d' % (chan + (chan_count[chan],)), src, dst,
-                        e.get('sclk'), self.decode(e.get('payload')))
-            self.messages.append(m)
-            return m
-
-        for k, st in enumerate(self.steps):
-            for e in st['events']:
-                if e['kind'] != 'send':
-                    continue
-                for d in e.get('to', []):
-                    m = new(st['pid'], d, e)
-                    m.send_ev, m.send_step = e, k
-                    unmatched[(m.src, d)].append(m)
-                    if isinstance(m.sclk, int):
-                        by_clock.setdefault((m.src, d, m.sclk), m)
-        self.recv_msg = {}              # (pid, seq) of a recv -> Message
-        for k, st in enumerate(self.steps):
-            for e in st['events']:
-                if e['kind'] != 'recv':
-                    continue
-                m = None
-                if isinstance(e.get('sclk'), int):
-                    m = by_clock.get((e['src'], st['pid'], e['sclk']))
-                    if m is not None and m.recv_ev is not None:
-                        m = None
-                if m is None:
-                    q = unmatched[(e['src'], st['pid'])]
-                    while q and q[0].recv_ev is not None:
-                        q.popleft()
-                    m = q[0] if q else None
-                if m is None:          # sender not recorded: make one up
-                    m = new(e['src'], st['pid'], e)
-                m.recv_ev, m.recv_step = e, k
-                self.recv_msg[(st['pid'], e['seq'])] = m
-        self.sent_msgs = collections.defaultdict(list)  # (pid, seq) of a send
-        self.recv_index = {}               # (dst, src, sclk) -> Message
+        self.times += [t - t0 for t in itertools.accumulate(ts, max)]
+        step = {i: k for k, i in enumerate(order)}
         for m in self.messages:
-            if m.send_ev is not None:
-                self.sent_msgs[(m.src, m.send_ev['seq'])].append(m)
-            if m.recv_ev is not None:
-                self.recv_index.setdefault((m.dst, m.src, m.sclk), m)
+            m.send_step, m.recv_step = step.get(m.send_seg), step.get(m.recv_seg)
 
 
 # --------------------------------------------------------------------------
@@ -497,18 +446,17 @@ class Trace:
 # --------------------------------------------------------------------------
 
 class ProcView:
-    """What a condition sees of one process: its fields plus id, cls,
-    status, clock, received, sent and inbox (as in DistAlgo Live)."""
+    """What a condition sees of process `p` in state `s`: its fields plus id,
+    cls, status, clock, received and sent (as in DistAlgo Live)."""
 
-    def __init__(self, st):
-        self.__dict__.update(st['values'])
-        self.id = st['pid']
-        self.cls = st['cls']
-        self.status = st['status']
-        self.clock = st['clock']
-        self.received = list(st['received'])
-        self.sent = list(st['sent'])
-        self.inbox = []
+    def __init__(self, p, s, decode):
+        self.__dict__.update({f: decode(v) for f, v in s['state'].items()})
+        self.id = p.pid
+        self.cls = p.cls
+        self.status = s['status']
+        self.clock = s['clock']
+        self.received = list(s['received'])
+        self.sent = list(s['sent'])
 
     def __hash__(self):
         return hash(self.id)
@@ -527,65 +475,69 @@ class Timeline:
 
     def __init__(self, trace):
         self.trace = trace
-        self.src = trace.src
         self._at = None          # (step, procs, in flight) of the last at()
+        # history of the whole run, each item tagged with its step; the
+        # snapshot sends the items up to the cursor
+        self.events = []         # sends and receives
+        self.changes = []        # field changes, with the code that caused them
+        self.logs = []           # output and lifecycle messages
+        self.step_lines = []     # step -> {(file, line)} it reaches, for breakpoints
         self._build_history()
 
     # ---- history (events, changes, logs), computed once ---------------
     def _build_history(self):
         T = self.trace
-        self.events, self.changes, self.logs = [], [], []
-        self.step_lines = []                  # step -> set of (file, line)
         procs, net = {}, {}
 
         def log(text, kind='system'):         # of the step being added
-            self.logs.append({'step': k, 'pid': p.key, 'kind': kind,
+            self.logs.append({'step': k, 'pid': name, 'kind': kind,
                               'text': text})
 
         for k, st in enumerate(T.steps):
-            pid = st['pid']
-            p = T.procs[pid]
+            pid = st['id']
+            name = T.name(pid)
             # the fields changed since the process' last event: by the
             # handler that just ran ('handled'), or else by run()
             for e, fields, old in self._apply(procs, net, k):
                 why = self._why(pid, e)
-                for f in fields:
-                    self.changes.append({
-                        'step': k, 'pid': p.key, 'field': f,
-                        'old': fmt(T.decode(old[f])) if f in old else None,
-                        'new': fmt(T.decode(e['state'][f])), 'why': why})
+                self.changes += [{'step': k, 'pid': name, 'field': f,
+                                  'old': fmt(T.decode(old[f])) if f in old else None,
+                                  'new': fmt(T.decode(e['state'][f])), 'why': why}
+                                 for f in fields]
             lines = set()
             for e in st['events']:
                 kind = e['kind']
                 for fr in (e.get('frames') or ())[:1]:
                     lines.add((fr['file'], fr['line']))
                 c = e.get('cause') or {}
-                if kind == 'handled' and c.get('file'):
+                if kind == TraceKind.Handled and c.get('file'):
                     lines.add((c['file'], c['line']))
-                if kind == 'run':
+                if kind == TraceKind.Setup:
+                    log('ran setup()')
+                elif kind == TraceKind.Run:
                     log('starts running')
-                elif kind == 'recv':
+                elif kind == TraceKind.Recv:
                     m = T.recv_msg.get((pid, e['seq']))
                     if m is not None:
                         self.events.append({
-                            'kind': 'recv', 'step': k, 'src': T.key(m.src),
-                            'dst': p.key, 'key': m.key, 'payload': fmt(m.value)})
-                        log('delivered %s from <%s>' % (fmt(m.value), T.key(m.src)))
-                elif kind == 'timeout':
+                            'kind': 'recv', 'step': k, 'src': T.name(m.src),
+                            'dst': name, 'key': m.key, 'payload': fmt(m.value)})
+                        log('delivered %s from <%s>' % (fmt(m.value), T.name(m.src)))
+                elif kind == TraceKind.Timeout:
                     log('timeout fired')
-                elif kind == 'send':
+                elif kind == TraceKind.Send:
                     why = self._why(pid, e)
                     for m in T.sent_msgs[(pid, e['seq'])]:
                         self.events.append({
-                            'kind': 'send', 'step': k, 'src': p.key,
-                            'dst': T.key(m.dst), 'key': m.key,
+                            'kind': 'send', 'step': k, 'src': name,
+                            'dst': T.name(m.dst), 'key': m.key,
                             'payload': fmt(m.value), 'why': why})
-                elif kind == 'output':
+                elif kind == TraceKind.Output:
                     log(e.get('text', ''), 'print')
-                elif kind == 'new':
+                elif kind == TraceKind.New:
                     for c in e.get('children', []):
-                        log('created %r' % T.pids.get(c, c))
-                elif kind == 'end':
+                        log('created %r' % (T.pid(c),))
+                elif kind == TraceKind.End:
                     status = e.get('status')
                     log({'done': 'run() finished', 'exited': 'exited',
                          'crashed': 'crashed: %s' % e.get('error')}.get(status, status),
@@ -594,7 +546,7 @@ class Timeline:
 
     # ---- explanations ------------------------------------------------
     def frame_loc(self, fr, main):
-        d = self.src.loc(fr['file'], fr['line'])
+        d = self.trace.src.loc(fr['file'], fr['line'])
         func = fr['func']
         d['func'] = MAIN if main and func == 'run' else (
             'receive' if re.match(r'^_\w+_handler_\d+$', func) else func)
@@ -605,10 +557,10 @@ class Timeline:
         for e in reversed(self.trace.procs[pid].events):
             if e['seq'] >= seq:
                 continue
-            if e['kind'] == 'await' and e.get('frames'):
+            if e['kind'] == TraceKind.Await and e.get('frames'):
                 fr = e['frames'][0]
-                return self.src.await_loc(fr['file'], fr['line'])
-            if e['kind'] in ('run', 'setup'):
+                return self.trace.src.await_loc(fr['file'], fr['line'])
+            if e['kind'] in (TraceKind.Run, TraceKind.Setup):
                 break
         return None
 
@@ -623,38 +575,36 @@ class Timeline:
         line, entries = None, []
         if frames:
             fr = frames[0]
-            line = self.src.loc(fr['file'], fr['line'])
-            entries = self.src.entry_chain(fr['file'], fr['line'])
+            line = self.trace.src.loc(fr['file'], fr['line'])
+            entries = self.trace.src.entry_chain(fr['file'], fr['line'])
             w = next((d for d in entries if d['kind'] == 'await'), None)
-            if e['kind'] in ('await', 'handler') and w:
+            if e['kind'] in (TraceKind.Await, TraceKind.Handler) and w:
                 # at an await's label: the label call has a nearby line
                 entries = entries[entries.index(w):]
                 line = {k: v for k, v in w.items() if k != 'kind'}
                 stack[0].update(line=w['line'], text=w['text'])
         elif cause.get('type') == 'handler' and cause.get('file'):
-            line = self.src.loc(cause['file'], cause['line'])
+            line = self.trace.src.loc(cause['file'], cause['line'])
 
-        def received(msg):      # the Message of a recorded {'src', 'sclk'}
-            return msg and T.recv_index.get((pid, msg.get('src'), msg.get('sclk')))
         why = {'type': 'run'}
         after = cause.get('after') or {}
         if cause.get('type') == 'handler':
-            m = received(cause.get('msg'))
+            m = T.recv_msg.get((pid, cause.get('recv')))
             why = {'type': 'handler',
                    'payload': fmt(m.value) if m else '?',
-                   'src': T.key(m.src) if m else '?',
+                   'src': T.name(m.src) if m else '?',
                    'msg': m.key if m else None,
                    'deliveredStep': m.recv_step if m else None,
                    'bindings': {k: fmt(T.decode(v))
                                 for k, v in (cause.get('bindings') or {}).items()}}
         elif after.get('type') == 'message':
-            m = received(after)
+            m = T.recv_msg.get((pid, after.get('recv')))
             if m is not None:
                 why['after'] = {'type': 'message', 'msg': m.key,
-                                'src': T.key(m.src),
+                                'src': T.name(m.src),
                                 'payload': fmt(m.value),
                                 'deliveredStep': m.recv_step,
-                                'await': self._await_before(pid, m.recv_ev['seq'])}
+                                'await': self._await_before(pid, after['recv'])}
         elif after.get('type') == 'timeout':
             why['after'] = {'type': 'timeout',
                             'await': self._await_before(pid, e['seq'])}
@@ -665,32 +615,23 @@ class Timeline:
     def _proc(self, procs, pid):
         """The state of `pid` in `procs`, made when first needed; None for a
         process that was not recorded."""
-        p = self.trace.procs.get(pid)
-        if p is not None and pid not in procs:
-            procs[pid] = {'pid': p.pid, 'key': p.key, 'cls': p.cls,
-                          'main': p.is_main, 'status': 'created',
-                          'state': {}, 'values': {}, 'frames': [],
+        if pid in self.trace.procs and pid not in procs:
+            procs[pid] = {'status': 'created', 'state': {}, 'frames': [],
                           'waiting': None, 'clock': None, 'sent': [],
                           'received': [], 'error': None}
         return procs.get(pid)
-
-    def _setup(self, s, pid):
-        """Sets the fields of `pid` after its setup() (before its first step)."""
-        s['state'] = {}
-        for e in self.trace.procs[pid].pre:
-            s['state'].update(e.get('state') or {})
-        s['values'] = {f: self.trace.decode(v) for f, v in s['state'].items()}
 
     def _apply(self, procs, net, k):
         """Applies step k to `procs` ({pid: state}) and `net` ({key: message
         in flight}); returns the field changes [(event, fields, old state)]."""
         T = self.trace
         st = T.steps[k]
-        pid = st['pid']
+        pid = st['id']
         s = self._proc(procs, pid)
-        if s['status'] in ('created', 'setup', 'ready'):
-            self._setup(s, pid)
-        s['status'] = 'running'
+        if st['kind'] != TraceKind.Setup:
+            s['status'] = 'running'
+        elif s['status'] == 'created':      # else start() came first: still ready
+            s['status'] = 'setup'
         s['waiting'] = None
         changes = []
         for e in st['events']:
@@ -703,46 +644,37 @@ class Timeline:
                 if fields:
                     changes.append((e, fields, old))
                 s['state'] = dict(old, **e['state'])
-                s['values'] = dict(s['values'], **{
-                    f: T.decode(e['state'][f]) for f in fields})
             if e.get('frames'):
                 s['frames'] = e['frames']     # where it is
             if e.get('locals') is not None:
                 s['main_locals'] = e['locals']   # main()'s variables
-            if kind == 'new':
+            if kind == TraceKind.New:
                 for c in e.get('children', []):
                     self._proc(procs, c)
-            elif kind == 'setupcall':
-                for c in e.get('procs', []):
-                    cs = self._proc(procs, c)
-                    if cs is not None:
-                        self._setup(cs, c)
-                        if cs['status'] == 'created':
-                            cs['status'] = 'setup'
-            elif kind == 'startcall':
+            elif kind == TraceKind.StartCall:
                 for c in e.get('procs', []):
                     cs = self._proc(procs, c)
                     if cs is not None and cs['status'] in ('created', 'setup'):
                         cs['status'] = 'ready'
-            elif kind == 'send':
+            elif kind == TraceKind.Send:
                 for m in T.sent_msgs[(pid, e['seq'])]:
-                    s['sent'].append((m.value, T.pids.get(m.dst, m.dst)))
+                    s['sent'].append((m.value, T.pid(m.dst)))
                     if m.recv_step is None or m.recv_step > k:
                         net[m.key] = m
-            elif kind == 'recv':
+            elif kind == TraceKind.Recv:
                 m = T.recv_msg.get((pid, e['seq']))
                 if m is not None:
-                    s['received'].append((m.value, T.pids.get(m.src, m.src)))
+                    s['received'].append((m.value, T.pid(m.src)))
                     net.pop(m.key, None)
-            elif kind == 'await':
+            elif kind == TraceKind.Await:
                 s['status'] = 'blocked'
                 s['frames'] = e.get('frames') or []
                 if e.get('frames'):
                     fr = e['frames'][0]
-                    w = self.src.await_loc(fr['file'], fr['line'])
+                    w = self.trace.src.await_loc(fr['file'], fr['line'])
                     w['timeout'] = e.get('timeout')
                     s['waiting'] = w
-            elif kind == 'end':
+            elif kind == TraceKind.End:
                 s['status'] = e.get('status') or 'done'
                 s['error'] = e.get('error')
                 s['frames'] = []
@@ -764,28 +696,32 @@ class Timeline:
         """The names a condition sees at step k."""
         T = self.trace
         procs, net = self.at(k)
-        views = {s['pid']: ProcView(s) for s in procs.values()
-                 if not s['main']}
+        views = {T.procs[id].pid: ProcView(T.procs[id], s, T.decode)
+                 for id, s in procs.items() if not T.procs[id].is_main}
 
-        def viewify(v, depth=0):
-            if isinstance(v, ReplayPid):
+        def viewify(v):
+            if isinstance(v, ProcessId):
                 return views.get(v, v)
-            if depth < 2 and isinstance(v, (set, frozenset, list, tuple)):
-                items = [viewify(x, depth + 1) for x in v]
-                return items if not isinstance(v, tuple) else tuple(items)
+            if isinstance(v, (set, frozenset, list, tuple)):
+                return type(v)(viewify(x) for x in v)
+            if isinstance(v, dict):
+                return {viewify(a): viewify(b) for a, b in v.items()}
             return v
 
+        # process fields too, so that x.p == pong and q.total_pings work
+        for view in views.values():
+            view.__dict__.update({f: viewify(x) for f, x in view.__dict__.items() if f != 'id'})
+
         scope = {}
-        for s in procs.values():
-            if s['main']:
+        for id, s in procs.items():
+            if T.procs[id].is_main:
                 # main()'s variables, as of its latest recorded event
                 for name, v in (s.get('main_locals') or {}).items():
                     scope[name] = viewify(T.decode(v))
         allv = list(views.values())
         scope.update({'procs': allv,
-                      'network': [(views.get(T.pids.get(m.src), m.src),
-                                   views.get(T.pids.get(m.dst), m.dst),
-                                   m.value) for m in net],
+                      'network': [viewify((T.pid(m.src), T.pid(m.dst), m.value))
+                                  for m in net],
                       'step': k})
         for cls in T.classes:
             scope[cls] = [v for v in allv if v.cls == cls]
@@ -800,13 +736,10 @@ class Timeline:
         if k is None or not (0 <= k < len(self.trace.steps)):
             return None
         st = self.trace.steps[k]
-        head = st['events'][0]
-        if head['kind'] == 'recv':
-            m = self.trace.recv_msg.get((st['pid'], head['seq']))
+        if st['kind'] == TraceKind.Recv:
+            m = self.trace.recv_msg.get((st['id'], st['events'][0]['seq']))
             return {'type': 'deliver', 'msg': m.key if m else None}
-        key = self.trace.procs[st['pid']].key
-        return {'type': 'timeout' if head['kind'] == 'timeout' else 'run',
-                'pid': key}
+        return {'type': st['kind'], 'pid': self.trace.name(st['id'])}
 
 
 # --------------------------------------------------------------------------
@@ -952,11 +885,9 @@ class ReplaySession:
     def __init__(self, path):
         self.path = os.path.abspath(path)
         self.trace = Trace(load(path))
-        self.src = self.trace.src
         self.timeline = Timeline(self.trace)
         self.conds = Conditions(self.trace)
         self.cursor = 0
-        self.gen = 1
         self.last_stop = None
         self.breaklines = set()           # (file, line)
         self.now = self.timeline.time(0)
@@ -966,7 +897,8 @@ class ReplaySession:
         states, net = tl.at(k)
         procs = []
         for pid, s in states.items():
-            frames = [tl.frame_loc(fr, s['main'])
+            p = T.procs[pid]
+            frames = [tl.frame_loc(fr, p.is_main)
                       for fr in reversed(s['frames'])]   # outermost first
             w = s['waiting']
             if frames and w:
@@ -975,14 +907,12 @@ class ReplaySession:
                 frames[-1].update(block=w['block'], line=w['line'],
                                   text=w['text'])
             procs.append({
-                'id': s['key'], 'cls': s['cls'], 'realId': pid,
-                'status': s['status'], 'isMain': s['main'],
-                'waitingAt': w, 'pausedAt': None, 'clock': s['clock'],
-                'state': {f: fmt(v) for f, v in s['values'].items()},
-                'frames': frames, 'queue': [],
-                'sent': len(s['sent']), 'received': len(s['received']),
-                'error': s['error']})
-        network = [{'key': m.key, 'src': T.key(m.src), 'dst': T.key(m.dst),
+                'id': T.name(pid), 'cls': p.cls, 'isMain': p.is_main,
+                'status': s['status'], 'waitingAt': w, 'clock': s['clock'],
+                'state': {f: fmt(T.decode(v)) for f, v in s['state'].items()},
+                'frames': frames, 'sent': len(s['sent']),
+                'received': len(s['received']), 'error': s['error']})
+        network = [{'key': m.key, 'src': T.name(m.src), 'dst': T.name(m.dst),
                     'payload': fmt(m.value), 'sentStep': m.send_step,
                     'sentAt': round(tl.time(m.send_step), 6),
                     'arrives': None if m.recv_step is None
@@ -990,7 +920,6 @@ class ReplaySession:
                     'recvStep': m.recv_step} for m in net]
         scope = tl.scope(k)
         snap = {
-            'running': True, 'gen': self.gen, 'delta': False,
             'step': k, 'time': round(self.now, 6),
             'processes': procs, 'network': network,
             # the history up to step k
@@ -998,12 +927,7 @@ class ReplaySession:
             'changes': [x for x in tl.changes if x['step'] <= k],
             'logs': [x for x in tl.logs if x['step'] <= k],
             'next': tl.action(k + 1),
-            'classes': T.classes,
-            'timers': [],
-            'cursor': k,
-            'redo': max(0, len(T.steps) - 1 - k),
             'lastAction': tl.action(k),
-            'paused': None,
             'lastStop': self.last_stop,
             'conditions': [
                 {'id': c['id'], 'expr': c['expr'], 'enabled': c['enabled'],
@@ -1013,7 +937,7 @@ class ReplaySession:
             'conditionNames': [n for n in scope if re.match(r'^[A-Za-z_]\w*$', n)],
             'conditionExample': Conditions.example(scope),
         }
-        if since and since.get('gen') == self.gen:
+        if since:
             # The history lists only grow with the step, so the page needs
             # only what it does not have yet; after a step back, only how
             # many items to keep ('trim').
@@ -1046,8 +970,8 @@ class ReplaySession:
         if not hits:
             return None
         fn, line = min(hits)
-        return {'reason': 'line', 'steps': n, 'at': self.src.loc(fn, line),
-                'pid': self.trace.procs[self.trace.steps[self.cursor]['pid']].key}
+        return {'reason': 'line', 'steps': n, 'at': self.trace.src.loc(fn, line),
+                'pid': self.trace.name(self.trace.steps[self.cursor]['id'])}
 
     def _values(self):
         return {cid: v for cid, v, _ in self.conds.evaluate(
@@ -1108,7 +1032,7 @@ def api(path, body):
     s = SESSION
     if path in ('/api/load', '/api/breakpoints'):
         # breakpoints {block name: [line in the block, ...]} as (file, line)
-        start = {b['name']: (b['file'], b['start']) for b in s.src.blocks}
+        start = {b['name']: (b['file'], b['start']) for b in s.trace.src.blocks}
         s.breaklines = {(start[name][0], start[name][1] + int(ln) - 1)
                         for name, lines in (body.get('breakpoints') or {}).items()
                         if name in start for ln in lines}
@@ -1119,9 +1043,9 @@ def api(path, body):
             return dict(s.snapshot(), info={
                 'logdir': s.path, 'program': T.main_file,
                 'steps': len(T.steps), 'processes': len(T.procs),
-                'messages': len(T.messages),
+                'messages': len(T.messages), 'classes': T.classes,
                 'blocks': [{'name': b['name'], 'code': b['code'],
-                            'kind': b['kind']} for b in s.src.blocks]})
+                            'kind': b['kind']} for b in s.trace.src.blocks]})
     elif path == '/api/step':
         s.last_stop = None
         if s.forward():

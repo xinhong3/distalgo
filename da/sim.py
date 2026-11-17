@@ -34,10 +34,9 @@ import itertools
 import functools
 import threading
 import collections
-import json
 import multiprocessing
 import os.path
-import da
+
 from . import common, pattern
 from .common import (builtin, internal, name_split_host, name_split_node,
                      ProcessId, get_runtime_option,
@@ -244,7 +243,7 @@ class DistProcess():
         program's frames that led to it (and main()'s variables, for main);
         with `why`, what the process is doing (the handler running, or what
         resumed run()); with `state`, the fields of `_state` that changed
-        since they were last recorded."""
+        since they were last recorded.  Returns the event's seq."""
         if self.__rec is None:
             return
         if where:
@@ -266,9 +265,13 @@ class DistProcess():
                 if self.__recfields.get(k, changed) != enc:
                     changed[k] = self.__recfields[k] = enc
             data['state'] = changed
+        if kind in (TraceKind.Run, TraceKind.Setup):
+            data['id'] = self.__encode(self.__id)
+        seq = next(self.__recseq)
         data.update(kind=kind, pid=_pid_str(self.__id),
-                    seq=next(self.__recseq), t=time.time(), clk=self._clock)
+                    seq=seq, t=time.time(), clk=self._clock)
         self.__rec.event(data)
+        return seq
 
     @property
     def _logical_clock(self):
@@ -882,10 +885,10 @@ class DistProcess():
 
         """
         leftovers = []
-        handler = args = msg = None
+        handler = args = recv = None
         while self.__jobq:
             try:
-                handler, args, msg = self.__jobq.popleft()
+                handler, args, recv = self.__jobq.popleft()
             except IndexError:
                 self._log.debug("Job item stolen by another thread.")
                 break
@@ -905,7 +908,7 @@ class DistProcess():
                         'type': 'handler', 'handler': handler.__name__,
                         'file': code and _program_file(code),
                         'line': code and code.co_firstlineno,
-                        'label': label, 'msg': msg,
+                        'label': label, 'recv': recv,
                         'bindings': {k: self.__encode(v, maxdepth=3, maxitems=20)
                                      for k, v in args.items()}}
                 try:
@@ -923,7 +926,7 @@ class DistProcess():
             else:
                 if self._keep_unmatched:
                     dbgmsg = "Skipping (%s, %r) due to label constraint."
-                    leftovers.append((handler, args, msg))
+                    leftovers.append((handler, args, recv))
                 else:
                     dbgmsg = "Dropping (%s, %r) due to label constraint."
                 self._log.debug(dbgmsg, handler, args)
@@ -1138,24 +1141,23 @@ class DistProcess():
                 return False
             self._logical_clock = max(self._logical_clock, peer_clk) + 1
 
-        msg = None
+        recv = None
         if self._recording:
-            # (sender, sender's clock) names the message: the replay pairs it
-            # with the send, which recorded the payload
-            msg = {'src': _pid_str(peer_id), 'sclk': peer_clk}
-            self._record(TraceKind.Recv, **msg)
+            # the replay pairs it with its send, which recorded the payload,
+            # by (sender, sender's clock)
+            recv = self._record(TraceKind.Recv, src=_pid_str(peer_id), sclk=peer_clk)
             # run() continues because of this message (until the next one):
-            self.__step_cause = dict(msg, type='message')
+            self.__step_cause = {'type': 'message', 'recv': recv}
         self.__trigger_event(
             pattern.ReceivedEvent(envelope=(peer_clk, None, peer_id),
-                                  message=payload), msg)
+                                  message=payload), recv)
         return True
 
-    def __trigger_event(self, event, msg=None):
+    def __trigger_event(self, event, recv=None):
         """Immediately triggers 'event', skipping the event queue.
 
-        `msg` (recording only) describes the received message, so a handler
-        run later can be explained by it.
+        `recv` (recording only) is the seq of the event that received the
+        message, so a handler run later can be explained by it.
 
         """
         for p in self._events:
@@ -1168,7 +1170,7 @@ class DistProcess():
                     # Call the update stub:
                     p.record_history(getattr(self, p.name), event.to_tuple())
                 for h in p.handlers:
-                    self.__jobq.append((h, copy.deepcopy(bindings), msg))
+                    self.__jobq.append((h, copy.deepcopy(bindings), recv))
 
     def __repr__(self):
         res = "<process {}#{}>"
@@ -1762,10 +1764,6 @@ class ProcessContainer:
             )
 
     def cleanup(self):
-        # maybe just write directly to file, instead of maintaining list
-        # json.dump({'d': _state_history}, _state_fd, default=custom_json_handler,indent=2)
-        # _state_fd.close()
-        # print("finish")
         if self._trace_in_fd:
             self._trace_in_fd.close()
             self._trace_in_fd = None

@@ -31,8 +31,8 @@ replayed from its log directory, or merged into a data file first:
 Options: `python -m da.replay DATA [--port 8642] [--no-browser]`.
 
 The data file is JSON: `{"format": "distalgo-replay", "version": 1,
-"program": <main .da file>, "sources": {file: text}, "processes": {process
-id: [event, ...]}, ...}`, the events as described below.
+"sources": {file: text}, "processes": {process id: [event, ...]}}`, the
+events as described below.
 
 ## What is recorded
 
